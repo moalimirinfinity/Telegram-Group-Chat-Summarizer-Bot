@@ -1,6 +1,15 @@
 # Python package dependencies for the Telegram Summarizer Bot
+# Run 'pip install -r requirements.txt'
 
-python-telegram-bot[ext]>=20.0  # Using version 20+ for async features
-google-generativeai>=0.4.0      # Gemini API library
-python-dotenv>=1.0.0            # To load environment variables from .env file
-httpx>=0.27                     # Keep httpx requirement flexible or pin as needed
+# Core Telegram library with extensions
+python-telegram-bot[ext]==21.2
+
+# Google Generative AI library
+google-generativeai==0.7.1
+
+# For loading environment variables from .env file
+python-dotenv==1.0.1
+
+# HTTP client used by underlying libraries
+# Often good to pin, but sometimes needs flexibility based on other libs
+httpx>=0.27,<0.28
