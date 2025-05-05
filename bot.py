@@ -12,7 +12,7 @@ from datetime import datetime, timezone, timedelta
 import google.generativeai as genai
 from google.generativeai.types import (
     GenerationConfig, SafetySettingDict, HarmCategory, HarmBlockThreshold,
-    BlockedPromptException, StopCandidateException
+    BlockedPromptException, StopCandidateException, Candidate # Added Candidate here
 )
 # Import specific API core exceptions if needed for network/auth issues
 # from google.api_core.exceptions import GoogleAPIError, ClientError
@@ -334,22 +334,28 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
         # Access text safely, checking candidate finish reason
         candidate = response.candidates[0]
-        if candidate.finish_reason == StopCandidateException.FinishReason.SAFETY:
+
+        # --- *** FIX APPLIED HERE *** ---
+        # Check finish reason using Candidate.FinishReason enum members
+        if candidate.finish_reason == Candidate.FinishReason.SAFETY:
             safety_ratings_str = ", ".join([f"{rating.category.name}: {rating.probability.name}" for rating in candidate.safety_ratings])
             logger.warning(f"Summary generation stopped due to SAFETY concerns for chat {chat_id} requested by {user_id}. Ratings: {safety_ratings_str}. Citations: {candidate.citation_metadata}")
             user_error_message = "❌ Summary generation stopped due to safety concerns. The generated content might contain sensitive topics based on safety ratings."
-            raise StopCandidateException(f"Safety stop: {safety_ratings_str}") # Raise specific error
+            # Use StopCandidateException just for raising the exception, not accessing the enum
+            raise StopCandidateException(f"Safety stop: {safety_ratings_str}")
 
-        elif candidate.finish_reason == StopCandidateException.FinishReason.RECITATION:
+        elif candidate.finish_reason == Candidate.FinishReason.RECITATION:
              logger.warning(f"Summary generation stopped due to RECITATION concerns for chat {chat_id} requested by {user_id}. Citations: {candidate.citation_metadata}")
              user_error_message = "❌ Summary generation stopped. The content may include material from protected sources."
              raise StopCandidateException("Recitation stop")
 
-        elif candidate.finish_reason not in [StopCandidateException.FinishReason.STOP, StopCandidateException.FinishReason.MAX_TOKENS]:
+        elif candidate.finish_reason not in [Candidate.FinishReason.STOP, Candidate.FinishReason.MAX_TOKENS]:
              # Handle other non-standard finish reasons (e.g., OTHER, UNKNOWN)
              logger.warning(f"Summary generation finished unexpectedly for chat {chat_id} requested by {user_id}. Reason: {candidate.finish_reason.name}")
              user_error_message = f"❌ Summary generation finished unexpectedly ({candidate.finish_reason.name}). Please try again."
              raise StopCandidateException(f"Unexpected finish: {candidate.finish_reason.name}")
+        # --- *** END OF FIX *** ---
+
 
         # Get the text content if valid
         if not candidate.content or not candidate.content.parts or not candidate.content.parts[0].text:
