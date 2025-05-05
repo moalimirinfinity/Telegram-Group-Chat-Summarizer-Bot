@@ -3,6 +3,8 @@ import logging
 import os
 import asyncio
 import time
+import traceback
+import google.api_core.exceptions
 from collections import defaultdict, deque
 from datetime import datetime, timezone, timedelta
 
@@ -369,7 +371,7 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         if not error_occurred and summary_text:
             user_last_summary_request[user_id] = time.monotonic()
 
-    # --- Refined Exception Handling ---
+# --- Refined Exception Handling ---
     except (BlockedPromptException, StopCandidateException) as safety_exception:
         # Specific exceptions caught above, user message already set
         # Logged internally, just mark error occurred
@@ -377,7 +379,8 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         error_occurred = True
         # user_error_message is already set specifically above
 
-    except genai.types.generation_types.InternalServerError as gemini_ise:
+    # Corrected exception type here:
+    except google.api_core.exceptions.InternalServerError as gemini_ise:
         logger.error(f"Gemini Internal Server Error during summary for chat {chat_id}, user {user_id}: {gemini_ise}", exc_info=True)
         user_error_message = "❌ The summarization service (Gemini) reported an internal error. Please try again later."
         error_occurred = True
@@ -386,10 +389,15 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         # Catch broader Google API errors (authentication, timeouts, etc.)
         logger.error(f"Google API Error during summary for chat {chat_id}, user {user_id}: {api_error}", exc_info=True)
         # Provide a slightly more specific error if possible, otherwise generic
-        if isinstance(api_error, google.api_core.exceptions.DeadlineExceeded):
+        if isinstance(api_error, google.api_core.exceptions.PermissionDenied): # Catch the 403 specifically here too
+             user_error_message = "❌ Permission denied by the summarization service. Please check the API key and project settings."
+        elif isinstance(api_error, google.api_core.exceptions.DeadlineExceeded):
              user_error_message = "❌ The request to the summarization service timed out. Please try again later."
         elif isinstance(api_error, google.api_core.exceptions.Unauthenticated):
              user_error_message = "❌ Authentication error with the summarization service. Please notify the bot admin."
+        # Keep the general GoogleAPIError catch
+        elif isinstance(api_error, google.api_core.exceptions.ResourceExhausted): # Catch 429 specifically
+             user_error_message = "❌ Rate limit exceeded for the summarization service. Please wait and try again."
         else:
              user_error_message = "❌ A Google API error occurred while generating the summary. Please notify the bot admin."
         error_occurred = True
@@ -505,8 +513,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 def main() -> None:
     """Sets up the Application and starts the bot polling."""
-    import traceback # Import traceback only needed for detailed error handler
-
     logger.info(f"--- Initializing Telegram Bot (PID: {os.getpid()}) ---")
     logger.info(f"Using Telegram Bot Token: {'*' * (len(TELEGRAM_TOKEN) - 4)}{TELEGRAM_TOKEN[-4:]}")
     logger.info(f"Using Gemini model: {GEMINI_MODEL_NAME}")
