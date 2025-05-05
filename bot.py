@@ -333,10 +333,17 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
         elif finish_reason not in ["STOP", "MAX_TOKENS"]:
              finish_reason_name = finish_reason if isinstance(finish_reason, str) else 'UNKNOWN'
-             logger.warning(f"Summary generation finished unexpectedly for chat {chat_id} requested by {user_id}. Reason: {finish_reason_name}")
-             user_error_message = f"❌ Summary generation finished unexpectedly ({finish_reason_name}). Please try again."
-             raise StopCandidateException(f"Unexpected finish: {finish_reason_name}")
-        # --- End of Standard Enum Check ---
+             logger.warning(f"Summary generation received unexpected finish reason for chat {chat_id} requested by {user_id}. Reason: {finish_reason_name}")
+             
+             # Only treat truly problematic reasons as errors
+             if finish_reason in ["SAFETY", "RECITATION", "BLOCKED"]:
+                 user_error_message = f"❌ Summary generation stopped ({finish_reason_name}). Please try again."
+                 raise StopCandidateException(f"Problematic finish: {finish_reason_name}")
+             
+             # For unknown or null finish reasons, continue processing
+             # This handles cases where the API might return None or new finish reasons
+             logger.info(f"Proceeding with content despite unexpected finish reason: {finish_reason_name}")
+             # Not raising an exception here, continue with content processing
 
         content = getattr(candidate, 'content', None)
         parts = getattr(content, 'parts', []) if content else []
