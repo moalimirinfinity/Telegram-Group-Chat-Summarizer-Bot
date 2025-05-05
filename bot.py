@@ -136,7 +136,7 @@ async def edit_or_reply_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int
         logger.error(f"Failed even to send new message to chat {chat_id} after edit failed or wasn't applicable: {send_err}")
 
 def detect_language(messages: list[tuple]) -> str:
-    """Detect the most common language in a list of messages."""
+    """Detect the most common language in a list of messages, supporting only English and Persian."""
     if not messages:
         return "en"  # Default to English if no messages
     
@@ -150,8 +150,16 @@ def detect_language(messages: list[tuple]) -> str:
     try:
         # Detect language
         detected = detect(all_text)
-        return detected
-    except LangDetectException:
+        
+        # Map Persian/Farsi variations to "fa", everything else to "en"
+        if detected in ["fa", "per", "pes", "ira"]:
+            logger.info(f"Detected Persian language: {detected}")
+            return "fa"
+        else:
+            logger.info(f"Detected language: {detected}, using English")
+            return "en"
+    except LangDetectException as e:
+        logger.warning(f"Language detection error: {e}")
         return "en"  # Default to English on detection error
 
 def create_message_link(chat_id: int, message_id: int) -> str:
@@ -202,21 +210,9 @@ def add_message_links(summary: str, chat_id: int) -> str:
     summary = re.sub(r'\[Message (\d+)\]', lambda m: replace_single_msg(m), summary)
     summary = re.sub(r'\[Messages ([\d\s,]+)\]', lambda m: replace_multi_msg(m), summary)
     
-    # Spanish pattern
-    summary = re.sub(r'\[Mensaje (\d+)\]', lambda m: replace_single_msg(m), summary)
-    summary = re.sub(r'\[Mensajes ([\d\s,]+)\]', lambda m: replace_multi_msg(m), summary)
-    
-    # Russian pattern
-    summary = re.sub(r'\[Сообщение (\d+)\]', lambda m: replace_single_msg(m), summary)
-    summary = re.sub(r'\[Сообщения ([\d\s,]+)\]', lambda m: replace_multi_msg(m), summary)
-    
-    # French pattern
-    summary = re.sub(r'\[Message (\d+)\]', lambda m: replace_single_msg(m), summary)
-    summary = re.sub(r'\[Messages ([\d\s,]+)\]', lambda m: replace_multi_msg(m), summary)
-    
-    # German pattern
-    summary = re.sub(r'\[Nachricht (\d+)\]', lambda m: replace_single_msg(m), summary)
-    summary = re.sub(r'\[Nachrichten ([\d\s,]+)\]', lambda m: replace_multi_msg(m), summary)
+    # Persian pattern
+    summary = re.sub(r'\[پیام (\d+)\]', lambda m: replace_single_msg(m), summary)
+    summary = re.sub(r'\[پیام‌های ([\d\s,،]+)\]', lambda m: replace_multi_msg(m), summary)
     
     return summary
 
@@ -230,8 +226,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # Get user locale from Telegram
     user_lang_code = update.effective_user.language_code if update.effective_user else None
     
-    # Fallback to 'en' if not available or not supported
-    lang = user_lang_code if user_lang_code in ["en", "es", "ru", "fr", "de"] else "en"
+    # Only support English and Persian
+    lang = "fa" if user_lang_code == "fa" else "en"
     
     # Multi-language start messages
     start_texts = {
@@ -245,45 +241,15 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "**Important:** For me to see messages and summarize them, 'Group Privacy' mode must be **disabled** in my settings. "
             "You can manage this via @BotFather (`/mybots` -> select bot -> `Bot Settings` -> `Group Privacy` -> `Turn off`)."
         ),
-        "es": (
-            "¡Hola! Soy un bot diseñado para resumir mensajes recientes en este grupo.\n\n"
-            f"Usa el comando `/{COMMAND_NAME} [N]` donde `N` es el número de mensajes recientes que quieres resumir. "
-            f"(Predeterminado: {DEFAULT_SUMMARY_MESSAGES}, Máx: {MAX_SUMMARY_MESSAGES}).\n"
-            f"Ejemplo: `/{COMMAND_NAME} 50`\n\n"
-            f"Uso el modelo `{GEMINI_MODEL_NAME}` para generar resúmenes.\n"
-            f"Hay un tiempo de espera de {SUMMARY_COOLDOWN_SECONDS} segundos por usuario para este comando para prevenir spam.\n\n"
-            "**Importante:** Para que pueda ver mensajes y resumirlos, el modo 'Privacidad de Grupo' debe estar **desactivado** en mis ajustes. "
-            "Puedes gestionarlo a través de @BotFather (`/mybots` -> selecciona bot -> `Bot Settings` -> `Group Privacy` -> `Turn off`)."
-        ),
-        "ru": (
-            "Привет! Я бот, созданный для обобщения недавних сообщений в этой группе.\n\n"
-            f"Используйте команду `/{COMMAND_NAME} [N]`, где `N` - количество последних сообщений, которые вы хотите обобщить. "
-            f"(По умолчанию: {DEFAULT_SUMMARY_MESSAGES}, Макс: {MAX_SUMMARY_MESSAGES}).\n"
-            f"Пример: `/{COMMAND_NAME} 50`\n\n"
-            f"Я использую модель `{GEMINI_MODEL_NAME}` для создания резюме.\n"
-            f"Есть {SUMMARY_COOLDOWN_SECONDS}-секундная задержка на каждого пользователя для этой команды, чтобы предотвратить спам.\n\n"
-            "**Важно:** Чтобы я мог видеть сообщения и делать резюме, режим 'Приватность группы' должен быть **отключен** в моих настройках. "
-            "Вы можете управлять этим через @BotFather (`/mybots` -> выберите бота -> `Bot Settings` -> `Group Privacy` -> `Turn off`)."
-        ),
-        "fr": (
-            "Bonjour ! Je suis un bot conçu pour résumer les messages récents dans ce groupe.\n\n"
-            f"Utilisez la commande `/{COMMAND_NAME} [N]` où `N` est le nombre de messages récents que vous souhaitez résumer. "
-            f"(Par défaut : {DEFAULT_SUMMARY_MESSAGES}, Max : {MAX_SUMMARY_MESSAGES}).\n"
-            f"Exemple : `/{COMMAND_NAME} 50`\n\n"
-            f"J'utilise le modèle `{GEMINI_MODEL_NAME}` pour générer des résumés.\n"
-            f"Il y a un temps de recharge de {SUMMARY_COOLDOWN_SECONDS} secondes par utilisateur pour cette commande afin d'éviter le spam.\n\n"
-            "**Important :** Pour que je puisse voir les messages et les résumer, le mode 'Confidentialité des groupes' doit être **désactivé** dans mes paramètres. "
-            "Vous pouvez gérer cela via @BotFather (`/mybots` -> sélectionnez le bot -> `Bot Settings` -> `Group Privacy` -> `Turn off`)."
-        ),
-        "de": (
-            "Hallo! Ich bin ein Bot, der entwickelt wurde, um aktuelle Nachrichten in dieser Gruppe zusammenzufassen.\n\n"
-            f"Verwenden Sie den Befehl `/{COMMAND_NAME} [N]`, wobei `N` die Anzahl der aktuellen Nachrichten ist, die Sie zusammenfassen möchten. "
-            f"(Standard: {DEFAULT_SUMMARY_MESSAGES}, Max: {MAX_SUMMARY_MESSAGES}).\n"
-            f"Beispiel: `/{COMMAND_NAME} 50`\n\n"
-            f"Ich verwende das Modell `{GEMINI_MODEL_NAME}` zum Generieren von Zusammenfassungen.\n"
-            f"Es gibt eine {SUMMARY_COOLDOWN_SECONDS}-Sekunden Abklingzeit pro Benutzer für diesen Befehl, um Spam zu verhindern.\n\n"
-            "**Wichtig:** Damit ich Nachrichten sehen und zusammenfassen kann, muss der 'Gruppendatenschutz'-Modus in meinen Einstellungen **deaktiviert** sein. "
-            "Sie können dies über @BotFather verwalten (`/mybots` -> Bot auswählen -> `Bot Settings` -> `Group Privacy` -> `Turn off`)."
+        "fa": (
+            "سلام! من یک ربات هستم که برای خلاصه‌سازی پیام‌های اخیر در این گروه طراحی شده‌ام.\n\n"
+            f"از دستور `/{COMMAND_NAME} [N]` استفاده کنید که در آن `N` تعداد پیام‌های اخیری است که می‌خواهید خلاصه شود. "
+            f"(پیش‌فرض: {DEFAULT_SUMMARY_MESSAGES}، حداکثر: {MAX_SUMMARY_MESSAGES}).\n"
+            f"مثال: `/{COMMAND_NAME} 50`\n\n"
+            f"من از مدل `{GEMINI_MODEL_NAME}` برای تولید خلاصه‌ها استفاده می‌کنم.\n"
+            f"یک زمان انتظار {SUMMARY_COOLDOWN_SECONDS} ثانیه‌ای برای هر کاربر برای این دستور وجود دارد تا از اسپم جلوگیری شود.\n\n"
+            "**مهم:** برای اینکه من بتوانم پیام‌ها را ببینم و خلاصه کنم، حالت 'حریم خصوصی گروه' باید در تنظیمات من **غیرفعال** باشد. "
+            "شما می‌توانید این را از طریق @BotFather مدیریت کنید (`/mybots` -> انتخاب ربات -> `Bot Settings` -> `Group Privacy` -> `Turn off`)."
         )
     }
     
@@ -418,65 +384,20 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             "summary_header": f"**✨ SUMMARY OF RECENT MESSAGES ✨**\n\n",
             "summary_footer": "\n\n*Note: Message links work in supergroups and public groups. In private groups, links may not work for all users.*"
         },
-        "es": {
-            "intro": "Eres un asistente útil encargado de resumir conversaciones de grupo de Telegram.\n"
-                    "Proporciona un resumen *conciso, neutral y bien estructurado* de los siguientes mensajes. "
-                    "Céntrate en los puntos clave de discusión, decisiones tomadas, preguntas realizadas y cualquier elemento de acción mencionado.\n"
-                    "Formatea el resumen claramente usando viñetas o listas numeradas para mejor legibilidad.\n"
-                    "Organiza el contenido por temas y usa formato para crear un resumen estructurado.\n"
-                    "Cuando hagas referencia a mensajes específicos, usa el ID del mensaje en formato '[Mensaje 123]' al final del punto relevante.\n"
-                    "Si varios mensajes discuten el mismo punto, agrúpalos como '[Mensajes 123, 124, 125]'.\n"
-                    "Mantén estas referencias al mínimo y solo para puntos importantes que los usuarios quieran encontrar en el chat original.",
-            "summary_request": "Resumen conciso:",
-            "processing_message": f"⏳ Obteniendo y resumiendo los últimos {actual_count} mensajes usando IA... por favor espera.",
-            "error_message": "❌ ¡Ups! Algo salió mal al generar el resumen. Por favor, inténtalo de nuevo más tarde. Si el problema persiste, contacta al administrador del bot.",
-            "summary_header": f"**✨ RESUMEN DE MENSAJES RECIENTES ✨**\n\n",
-            "summary_footer": "\n\n*Nota: Los enlaces a mensajes funcionan en supergrupos y grupos públicos. En grupos privados, es posible que los enlaces no funcionen para todos los usuarios.*"
-        },
-        "ru": {
-            "intro": "Вы - полезный ассистент, которому поручено обобщать групповые чаты Telegram.\n"
-                    "Предоставьте *краткое, нейтральное и хорошо структурированное* резюме следующих сообщений. "
-                    "Сосредоточьтесь на ключевых моментах обсуждения, принятых решениях, заданных вопросах и любых упомянутых действиях.\n"
-                    "Четко форматируйте резюме, используя маркеры или нумерованные списки для лучшей читаемости.\n"
-                    "Организуйте содержание по темам и используйте форматирование для создания структурированного резюме.\n"
-                    "При ссылке на конкретные сообщения используйте ID сообщения в формате '[Сообщение 123]' в конце соответствующего пункта.\n"
-                    "Если несколько сообщений обсуждают один и тот же вопрос, сгруппируйте их как '[Сообщения 123, 124, 125]'.\n"
-                    "Сохраняйте эти ссылки минимальными и только для важных пунктов, которые пользователи могут захотеть найти в оригинальном чате.",
-            "summary_request": "Краткое резюме:",
-            "processing_message": f"⏳ Получение и составление резюме последних {actual_count} сообщений с использованием ИИ... пожалуйста, подождите.",
-            "error_message": "❌ Упс! Что-то пошло не так при генерации резюме. Пожалуйста, повторите попытку позже. Если проблема не исчезнет, обратитесь к администратору бота.",
-            "summary_header": f"**✨ РЕЗЮМЕ НЕДАВНИХ СООБЩЕНИЙ ✨**\n\n",
-            "summary_footer": "\n\n*Примечание: Ссылки на сообщения работают в супергруппах и публичных группах. В приватных группах ссылки могут работать не для всех пользователей.*"
-        },
-        "fr": {
-            "intro": "Vous êtes un assistant utile chargé de résumer les conversations de groupe Telegram.\n"
-                    "Fournissez un résumé *concis, neutre et bien structuré* des messages suivants. "
-                    "Concentrez-vous sur les points clés de discussion, les décisions prises, les questions posées et toute action mentionnée.\n"
-                    "Formatez clairement le résumé en utilisant des puces ou des listes numérotées pour une meilleure lisibilité.\n"
-                    "Organisez le contenu par thèmes et utilisez le formatage pour créer un résumé structuré.\n"
-                    "Lorsque vous faites référence à des messages spécifiques, utilisez l'ID du message au format '[Message 123]' à la fin du point concerné.\n"
-                    "Si plusieurs messages abordent le même sujet, regroupez-les comme '[Messages 123, 124, 125]'.\n"
-                    "Gardez ces références au minimum et uniquement pour les points importants que les utilisateurs pourraient vouloir retrouver dans le chat original.",
-            "summary_request": "Résumé concis:",
-            "processing_message": f"⏳ Récupération et résumé des {actual_count} derniers messages avec IA... veuillez patienter.",
-            "error_message": "❌ Oups! Une erreur s'est produite lors de la génération du résumé. Veuillez réessayer plus tard. Si le problème persiste, contactez l'administrateur du bot.",
-            "summary_header": f"**✨ RÉSUMÉ DES MESSAGES RÉCENTS ✨**\n\n",
-            "summary_footer": "\n\n*Remarque: Les liens vers les messages fonctionnent dans les supergroupes et les groupes publics. Dans les groupes privés, les liens peuvent ne pas fonctionner pour tous les utilisateurs.*"
-        },
-        "de": {
-            "intro": "Sie sind ein hilfreicher Assistent, der Telegram-Gruppenchats zusammenfasst.\n"
-                    "Geben Sie eine *präzise, neutrale und gut strukturierte* Zusammenfassung der folgenden Nachrichten. "
-                    "Konzentrieren Sie sich auf wichtige Diskussionspunkte, getroffene Entscheidungen, gestellte Fragen und erwähnte Aktionspunkte.\n"
-                    "Formatieren Sie die Zusammenfassung übersichtlich mit Aufzählungspunkten oder nummerierten Listen für bessere Lesbarkeit.\n"
-                    "Organisieren Sie den Inhalt nach Themen und verwenden Sie Formatierung für eine strukturierte Zusammenfassung.\n"
-                    "Bei Verweisen auf bestimmte Nachrichten verwenden Sie die Nachrichten-ID im Format '[Nachricht 123]' am Ende des entsprechenden Punktes.\n"
-                    "Wenn mehrere Nachrichten dasselbe Thema behandeln, gruppieren Sie sie wie '[Nachrichten 123, 124, 125]'.\n"
-                    "Halten Sie diese Verweise minimal und nur für wichtige Punkte, die Benutzer im ursprünglichen Chat finden möchten.",
-            "summary_request": "Präzise Zusammenfassung:",
-            "processing_message": f"⏳ Abrufen und Zusammenfassen der letzten {actual_count} Nachrichten mit KI... bitte warten.",
-            "error_message": "❌ Hoppla! Beim Erstellen der Zusammenfassung ist ein Fehler aufgetreten. Bitte versuchen Sie es später erneut. Wenn das Problem weiterhin besteht, kontaktieren Sie den Bot-Administrator.",
-            "summary_header": f"**✨ ZUSAMMENFASSUNG DER LETZTEN NACHRICHTEN ✨**\n\n",
-            "summary_footer": "\n\n*Hinweis: Nachrichtenlinks funktionieren in Supergruppen und öffentlichen Gruppen. In privaten Gruppen funktionieren Links möglicherweise nicht für alle Benutzer.*"
+        "fa": {
+            "intro": "شما یک دستیار هوشمند هستید که وظیفه خلاصه‌سازی گفتگوهای گروهی تلگرام را دارید.\n"
+                    "یک خلاصه *موجز، بی‌طرفانه، و ساختار یافته* از پیام‌های زیر ارائه دهید. "
+                    "بر نکات کلیدی بحث، تصمیمات گرفته شده، سؤالات مطرح شده، و هرگونه موارد عملی ذکر شده تمرکز کنید.\n"
+                    "خلاصه را به وضوح با استفاده از نقاط گلوله‌ای یا لیست‌های شماره‌دار برای خوانایی بهتر قالب‌بندی کنید.\n"
+                    "محتوا را بر اساس موضوعات سازماندهی کنید و از قالب‌بندی برای ایجاد یک خلاصه ساختار یافته استفاده کنید.\n"
+                    "هنگام اشاره به پیام‌های خاص، از شناسه پیام در قالب '[پیام 123]' در انتهای نکته مربوطه استفاده کنید.\n"
+                    "اگر چندین پیام درباره یک نکته بحث می‌کنند، آنها را مانند '[پیام‌های 123، 124، 125]' گروه‌بندی کنید.\n"
+                    "این ارجاعات را حداقل نگه دارید و فقط برای نکات مهمی که کاربران ممکن است بخواهند در گفتگوی اصلی پیدا کنند استفاده کنید.",
+            "summary_request": "خلاصه موجز:",
+            "processing_message": f"⏳ در حال دریافت و خلاصه‌سازی {actual_count} پیام اخیر با استفاده از هوش مصنوعی... لطفاً صبر کنید.",
+            "error_message": "❌ اوپس! هنگام تولید خلاصه مشکلی پیش آمد. لطفاً بعداً دوباره امتحان کنید. اگر مشکل ادامه داشت، با مدیر ربات تماس بگیرید.",
+            "summary_header": f"**✨ خلاصه پیام‌های اخیر ✨**\n\n",
+            "summary_footer": "\n\n*توجه: لینک‌های پیام در ابرگروه‌ها و گروه‌های عمومی کار می‌کنند. در گروه‌های خصوصی، ممکن است لینک‌ها برای همه کاربران کار نکنند.*"
         }
     }
     
