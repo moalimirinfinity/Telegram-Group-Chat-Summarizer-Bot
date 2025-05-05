@@ -298,7 +298,28 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         # --- Standard Enum Check (for v0.8.5+) ---
         if finish_reason == "SAFETY":
             safety_ratings = getattr(candidate, 'safety_ratings', [])
-            safety_ratings_str = ", ".join([f"{rating.category.name}: {rating.probability.name}" for rating in safety_ratings])
+            # Handle both string and enum safety ratings formats
+            safety_ratings_str = ""
+            try:
+                # Try to handle different possible formats of safety ratings
+                if safety_ratings:
+                    ratings_parts = []
+                    for rating in safety_ratings:
+                        category = getattr(rating, 'category', None)
+                        probability = getattr(rating, 'probability', None)
+                        
+                        # Get names from objects or use values directly if they're strings
+                        category_name = getattr(category, 'name', str(category)) if category else 'Unknown'
+                        probability_name = getattr(probability, 'name', str(probability)) if probability else 'Unknown'
+                        
+                        ratings_parts.append(f"{category_name}: {probability_name}")
+                    
+                    safety_ratings_str = ", ".join(ratings_parts)
+                else:
+                    safety_ratings_str = "No detailed ratings available"
+            except Exception as e:
+                safety_ratings_str = f"Error parsing ratings: {e}"
+                
             citation_metadata = getattr(candidate, 'citation_metadata', None)
             logger.warning(f"Summary generation stopped due to SAFETY concerns for chat {chat_id} requested by {user_id}. Ratings: {safety_ratings_str}. Citations: {citation_metadata}")
             user_error_message = "❌ Summary generation stopped due to safety concerns. The generated content might contain sensitive topics based on safety ratings."
@@ -311,7 +332,7 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
              raise StopCandidateException("Recitation stop")
 
         elif finish_reason not in ["STOP", "MAX_TOKENS"]:
-             finish_reason_name = getattr(finish_reason, 'name', 'UNKNOWN')
+             finish_reason_name = finish_reason if isinstance(finish_reason, str) else 'UNKNOWN'
              logger.warning(f"Summary generation finished unexpectedly for chat {chat_id} requested by {user_id}. Reason: {finish_reason_name}")
              user_error_message = f"❌ Summary generation finished unexpectedly ({finish_reason_name}). Please try again."
              raise StopCandidateException(f"Unexpected finish: {finish_reason_name}")
@@ -321,14 +342,14 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         parts = getattr(content, 'parts', []) if content else []
 
         if not parts:
-             finish_reason_name = getattr(finish_reason, 'name', 'UNKNOWN')
+             finish_reason_name = finish_reason if isinstance(finish_reason, str) else 'UNKNOWN'
              logger.warning(f"Gemini API returned no content parts for chat {chat_id} requested by {user_id}. Finish Reason: {finish_reason_name}. Response: {response}")
              user_error_message = "❌ Summary generation resulted in no content. This might be due to filtering or an API issue. Please try again later."
              raise ValueError("Received no content/parts from API.")
 
         text_part = getattr(parts[0], 'text', None)
         if text_part is None:
-             finish_reason_name = getattr(finish_reason, 'name', 'UNKNOWN')
+             finish_reason_name = finish_reason if isinstance(finish_reason, str) else 'UNKNOWN'
              logger.warning(f"Gemini API returned empty text in content part for chat {chat_id} requested by {user_id}. Finish Reason: {finish_reason_name}. Response: {response}")
              user_error_message = "❌ Summary generation resulted in empty content. This might be due to filtering or an API issue. Please try again later."
              raise ValueError("Received empty text part from API.")
