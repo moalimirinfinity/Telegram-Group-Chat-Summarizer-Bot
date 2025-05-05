@@ -296,7 +296,7 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         finish_reason = getattr(candidate, 'finish_reason', None)
 
         # --- Standard Enum Check (for v0.8.5+) ---
-        if finish_reason == genai.types.FinishReason.SAFETY:
+        if finish_reason == "SAFETY":
             safety_ratings = getattr(candidate, 'safety_ratings', [])
             safety_ratings_str = ", ".join([f"{rating.category.name}: {rating.probability.name}" for rating in safety_ratings])
             citation_metadata = getattr(candidate, 'citation_metadata', None)
@@ -304,13 +304,13 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             user_error_message = "❌ Summary generation stopped due to safety concerns. The generated content might contain sensitive topics based on safety ratings."
             raise StopCandidateException(f"Safety stop: {safety_ratings_str}")
 
-        elif finish_reason == genai.types.FinishReason.RECITATION:
+        elif finish_reason == "RECITATION":
              citation_metadata = getattr(candidate, 'citation_metadata', None)
              logger.warning(f"Summary generation stopped due to RECITATION concerns for chat {chat_id} requested by {user_id}. Citations: {citation_metadata}")
              user_error_message = "❌ Summary generation stopped. The content may include material from protected sources."
              raise StopCandidateException("Recitation stop")
 
-        elif finish_reason not in [genai.types.FinishReason.STOP, genai.types.FinishReason.MAX_TOKENS]:
+        elif finish_reason not in ["STOP", "MAX_TOKENS"]:
              finish_reason_name = getattr(finish_reason, 'name', 'UNKNOWN')
              logger.warning(f"Summary generation finished unexpectedly for chat {chat_id} requested by {user_id}. Reason: {finish_reason_name}")
              user_error_message = f"❌ Summary generation finished unexpectedly ({finish_reason_name}). Please try again."
