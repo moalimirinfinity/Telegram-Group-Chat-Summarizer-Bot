@@ -17,6 +17,8 @@ from google.generativeai.types import (
     GenerationConfig, SafetySettingDict, HarmCategory, HarmBlockThreshold,
     BlockedPromptException, StopCandidateException
 )
+# Language detection
+from langdetect import detect, LangDetectException
 # Import specific API core exceptions if needed for network/auth issues
 # from google.api_core.exceptions import GoogleAPIError, ClientError
 from dotenv import load_dotenv
@@ -88,6 +90,7 @@ logger = logging.getLogger(__name__)
 # --- In-Memory Caches ---
 message_cache: dict[int, deque] = defaultdict(lambda: deque(maxlen=MESSAGE_CACHE_SIZE))
 user_last_summary_request: dict[int, float] = {}
+chat_language_cache: dict[int, str] = {}  # Store detected language by chat_id
 
 # --- Helper Functions ---
 
@@ -132,6 +135,25 @@ async def edit_or_reply_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int
     except TelegramError as send_err:
         logger.error(f"Failed even to send new message to chat {chat_id} after edit failed or wasn't applicable: {send_err}")
 
+def detect_language(messages: list[tuple]) -> str:
+    """Detect the most common language in a list of messages."""
+    if not messages:
+        return "en"  # Default to English if no messages
+    
+    # Concatenate all message texts with spaces
+    all_text = " ".join([msg[2] for msg in messages if msg[2] and len(msg[2]) > 5])
+    
+    # Return English if not enough text to detect
+    if len(all_text) < 20:
+        return "en"
+        
+    try:
+        # Detect language
+        detected = detect(all_text)
+        return detected
+    except LangDetectException:
+        return "en"  # Default to English on detection error
+
 # --- Telegram Command Handlers ---
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -139,18 +161,68 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not update.message:
         return
 
-    start_text = (
-        "Hi! I'm a bot designed to summarize recent messages in this group.\n\n"
-        f"Use the command `/{COMMAND_NAME} [N]` where `N` is the number of recent messages you want to summarize. "
-        f"(Default: {DEFAULT_SUMMARY_MESSAGES}, Max: {MAX_SUMMARY_MESSAGES}).\n"
-        f"Example: `/{COMMAND_NAME} 50`\n\n"
-        f"I use the `{GEMINI_MODEL_NAME}` model for generating summaries.\n"
-        f"There's a {SUMMARY_COOLDOWN_SECONDS}-second cooldown per user for this command to prevent spam.\n\n"
-        "**Important:** For me to see messages and summarize them, 'Group Privacy' mode must be **disabled** in my settings. "
-        "You can manage this via @BotFather (`/mybots` -> select bot -> `Bot Settings` -> `Group Privacy` -> `Turn off`)."
-    )
+    # Get user locale from Telegram
+    user_lang_code = update.effective_user.language_code if update.effective_user else None
+    
+    # Fallback to 'en' if not available or not supported
+    lang = user_lang_code if user_lang_code in ["en", "es", "ru", "fr", "de"] else "en"
+    
+    # Multi-language start messages
+    start_texts = {
+        "en": (
+            "Hi! I'm a bot designed to summarize recent messages in this group.\n\n"
+            f"Use the command `/{COMMAND_NAME} [N]` where `N` is the number of recent messages you want to summarize. "
+            f"(Default: {DEFAULT_SUMMARY_MESSAGES}, Max: {MAX_SUMMARY_MESSAGES}).\n"
+            f"Example: `/{COMMAND_NAME} 50`\n\n"
+            f"I use the `{GEMINI_MODEL_NAME}` model for generating summaries.\n"
+            f"There's a {SUMMARY_COOLDOWN_SECONDS}-second cooldown per user for this command to prevent spam.\n\n"
+            "**Important:** For me to see messages and summarize them, 'Group Privacy' mode must be **disabled** in my settings. "
+            "You can manage this via @BotFather (`/mybots` -> select bot -> `Bot Settings` -> `Group Privacy` -> `Turn off`)."
+        ),
+        "es": (
+            "¡Hola! Soy un bot diseñado para resumir mensajes recientes en este grupo.\n\n"
+            f"Usa el comando `/{COMMAND_NAME} [N]` donde `N` es el número de mensajes recientes que quieres resumir. "
+            f"(Predeterminado: {DEFAULT_SUMMARY_MESSAGES}, Máx: {MAX_SUMMARY_MESSAGES}).\n"
+            f"Ejemplo: `/{COMMAND_NAME} 50`\n\n"
+            f"Uso el modelo `{GEMINI_MODEL_NAME}` para generar resúmenes.\n"
+            f"Hay un tiempo de espera de {SUMMARY_COOLDOWN_SECONDS} segundos por usuario para este comando para prevenir spam.\n\n"
+            "**Importante:** Para que pueda ver mensajes y resumirlos, el modo 'Privacidad de Grupo' debe estar **desactivado** en mis ajustes. "
+            "Puedes gestionarlo a través de @BotFather (`/mybots` -> selecciona bot -> `Bot Settings` -> `Group Privacy` -> `Turn off`)."
+        ),
+        "ru": (
+            "Привет! Я бот, созданный для обобщения недавних сообщений в этой группе.\n\n"
+            f"Используйте команду `/{COMMAND_NAME} [N]`, где `N` - количество последних сообщений, которые вы хотите обобщить. "
+            f"(По умолчанию: {DEFAULT_SUMMARY_MESSAGES}, Макс: {MAX_SUMMARY_MESSAGES}).\n"
+            f"Пример: `/{COMMAND_NAME} 50`\n\n"
+            f"Я использую модель `{GEMINI_MODEL_NAME}` для создания резюме.\n"
+            f"Есть {SUMMARY_COOLDOWN_SECONDS}-секундная задержка на каждого пользователя для этой команды, чтобы предотвратить спам.\n\n"
+            "**Важно:** Чтобы я мог видеть сообщения и делать резюме, режим 'Приватность группы' должен быть **отключен** в моих настройках. "
+            "Вы можете управлять этим через @BotFather (`/mybots` -> выберите бота -> `Bot Settings` -> `Group Privacy` -> `Turn off`)."
+        ),
+        "fr": (
+            "Bonjour ! Je suis un bot conçu pour résumer les messages récents dans ce groupe.\n\n"
+            f"Utilisez la commande `/{COMMAND_NAME} [N]` où `N` est le nombre de messages récents que vous souhaitez résumer. "
+            f"(Par défaut : {DEFAULT_SUMMARY_MESSAGES}, Max : {MAX_SUMMARY_MESSAGES}).\n"
+            f"Exemple : `/{COMMAND_NAME} 50`\n\n"
+            f"J'utilise le modèle `{GEMINI_MODEL_NAME}` pour générer des résumés.\n"
+            f"Il y a un temps de recharge de {SUMMARY_COOLDOWN_SECONDS} secondes par utilisateur pour cette commande afin d'éviter le spam.\n\n"
+            "**Important :** Pour que je puisse voir les messages et les résumer, le mode 'Confidentialité des groupes' doit être **désactivé** dans mes paramètres. "
+            "Vous pouvez gérer cela via @BotFather (`/mybots` -> sélectionnez le bot -> `Bot Settings` -> `Group Privacy` -> `Turn off`)."
+        ),
+        "de": (
+            "Hallo! Ich bin ein Bot, der entwickelt wurde, um aktuelle Nachrichten in dieser Gruppe zusammenzufassen.\n\n"
+            f"Verwenden Sie den Befehl `/{COMMAND_NAME} [N]`, wobei `N` die Anzahl der aktuellen Nachrichten ist, die Sie zusammenfassen möchten. "
+            f"(Standard: {DEFAULT_SUMMARY_MESSAGES}, Max: {MAX_SUMMARY_MESSAGES}).\n"
+            f"Beispiel: `/{COMMAND_NAME} 50`\n\n"
+            f"Ich verwende das Modell `{GEMINI_MODEL_NAME}` zum Generieren von Zusammenfassungen.\n"
+            f"Es gibt eine {SUMMARY_COOLDOWN_SECONDS}-Sekunden Abklingzeit pro Benutzer für diesen Befehl, um Spam zu verhindern.\n\n"
+            "**Wichtig:** Damit ich Nachrichten sehen und zusammenfassen kann, muss der 'Gruppendatenschutz'-Modus in meinen Einstellungen **deaktiviert** sein. "
+            "Sie können dies über @BotFather verwalten (`/mybots` -> Bot auswählen -> `Bot Settings` -> `Group Privacy` -> `Turn off`)."
+        )
+    }
+    
     await update.message.reply_text(
-        start_text,
+        start_texts.get(lang, start_texts["en"]),
         parse_mode=constants.ParseMode.MARKDOWN,
         disable_web_page_preview=True
     )
@@ -256,21 +328,104 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if len(formatted_text) > 32000:
         logger.warning(f"Formatted text for chat {chat_id} exceeds 32,000 chars ({len(formatted_text)}). May be truncated by API or cause errors.")
 
+    # Detect language if not already cached
+    chat_lang = chat_language_cache.get(chat_id, None)
+    if not chat_lang:
+        chat_lang = detect_language(messages_to_summarize)
+        chat_language_cache[chat_id] = chat_lang
+        logger.info(f"Detected language for chat {chat_id}: {chat_lang}")
+    
+    # Multi-language prompt templates
+    prompt_templates = {
+        "en": {
+            "intro": "You are a helpful assistant tasked with summarizing Telegram group chat conversations.\n"
+                   "Provide a *concise, neutral, and objective* summary of the following messages. "
+                   "Focus on key discussion points, decisions made, questions asked, and any action items mentioned.\n"
+                   "Format the summary clearly, perhaps using bullet points or numbered lists for readability.\n"
+                   "If specific points are derived from messages, reference the original message ID(s) like '(ID: 123)' or '(IDs: 124, 125)' where appropriate.",
+            "summary_request": "Concise Summary:",
+            "processing_message": f"⏳ Fetching and summarizing the last {actual_count} cached messages using `{GEMINI_MODEL_NAME}`... please wait.",
+            "error_message": "❌ Oops! Something went wrong while generating the summary. Please try again later. If the problem persists, contact the bot admin.",
+            "summary_header": f"✨ **Summary of last {actual_count} messages (approx. ID {{}}-{{}}):** ✨\n\n",
+            "summary_footer": f"*Summary generated by `{GEMINI_MODEL_NAME}`. Message IDs are for reference.*"
+        },
+        "es": {
+            "intro": "Eres un asistente útil encargado de resumir conversaciones de grupo de Telegram.\n"
+                   "Proporciona un resumen *conciso, neutral y objetivo* de los siguientes mensajes. "
+                   "Céntrate en los puntos clave de discusión, decisiones tomadas, preguntas realizadas y cualquier elemento de acción mencionado.\n"
+                   "Formatea el resumen claramente, quizás usando viñetas o listas numeradas para facilitar la lectura.\n"
+                   "Si ciertos puntos se derivan de mensajes específicos, haz referencia al ID del mensaje original como '(ID: 123)' o '(IDs: 124, 125)' cuando sea apropiado.",
+            "summary_request": "Resumen conciso:",
+            "processing_message": f"⏳ Obteniendo y resumiendo los últimos {actual_count} mensajes usando `{GEMINI_MODEL_NAME}`... por favor espera.",
+            "error_message": "❌ ¡Ups! Algo salió mal al generar el resumen. Por favor, inténtalo de nuevo más tarde. Si el problema persiste, contacta al administrador del bot.",
+            "summary_header": f"✨ **Resumen de los últimos {actual_count} mensajes (aprox. ID {{}}-{{}}):** ✨\n\n",
+            "summary_footer": f"*Resumen generado por `{GEMINI_MODEL_NAME}`. Los IDs de mensajes son para referencia.*"
+        },
+        "ru": {
+            "intro": "Вы - полезный ассистент, которому поручено обобщать групповые чаты Telegram.\n"
+                   "Предоставьте *краткое, нейтральное и объективное* резюме следующих сообщений. "
+                   "Сосредоточьтесь на ключевых моментах обсуждения, принятых решениях, заданных вопросах и любых упомянутых действиях.\n"
+                   "Четко форматируйте резюме, возможно, используя маркеры или нумерованные списки для удобства чтения.\n"
+                   "Если конкретные моменты получены из сообщений, указывайте ID исходного сообщения как '(ID: 123)' или '(IDs: 124, 125)', где это уместно.",
+            "summary_request": "Краткое резюме:",
+            "processing_message": f"⏳ Получение и составление резюме последних {actual_count} сообщений с использованием `{GEMINI_MODEL_NAME}`... пожалуйста, подождите.",
+            "error_message": "❌ Упс! Что-то пошло не так при генерации резюме. Пожалуйста, повторите попытку позже. Если проблема не исчезнет, обратитесь к администратору бота.",
+            "summary_header": f"✨ **Резюме последних {actual_count} сообщений (примерно ID {{}}-{{}}):** ✨\n\n",
+            "summary_footer": f"*Резюме создано с помощью `{GEMINI_MODEL_NAME}`. ID сообщений указаны для справки.*"
+        },
+        "fr": {
+            "intro": "Vous êtes un assistant utile chargé de résumer les conversations de groupe Telegram.\n"
+                   "Fournissez un résumé *concis, neutre et objectif* des messages suivants. "
+                   "Concentrez-vous sur les points clés de discussion, les décisions prises, les questions posées et toute action mentionnée.\n"
+                   "Formatez clairement le résumé, peut-être en utilisant des puces ou des listes numérotées pour une meilleure lisibilité.\n"
+                   "Si des points spécifiques sont tirés de messages, référencez l'ID du message original comme '(ID: 123)' ou '(IDs: 124, 125)' le cas échéant.",
+            "summary_request": "Résumé concis:",
+            "processing_message": f"⏳ Récupération et résumé des {actual_count} derniers messages avec `{GEMINI_MODEL_NAME}`... veuillez patienter.",
+            "error_message": "❌ Oups! Une erreur s'est produite lors de la génération du résumé. Veuillez réessayer plus tard. Si le problème persiste, contactez l'administrateur du bot.",
+            "summary_header": f"✨ **Résumé des {actual_count} derniers messages (ID approx. {{}}-{{}}):** ✨\n\n",
+            "summary_footer": f"*Résumé généré par `{GEMINI_MODEL_NAME}`. Les ID de messages sont pour référence.*"
+        },
+        "de": {
+            "intro": "Sie sind ein hilfreicher Assistent, der Telegram-Gruppenchats zusammenfasst.\n"
+                   "Geben Sie eine *präzise, neutrale und objektive* Zusammenfassung der folgenden Nachrichten. "
+                   "Konzentrieren Sie sich auf wichtige Diskussionspunkte, getroffene Entscheidungen, gestellte Fragen und erwähnte Aktionspunkte.\n"
+                   "Formatieren Sie die Zusammenfassung klar, eventuell mit Aufzählungspunkten oder nummerierten Listen für bessere Lesbarkeit.\n"
+                   "Wenn bestimmte Punkte aus Nachrichten abgeleitet werden, referenzieren Sie die ursprüngliche Nachrichten-ID wie '(ID: 123)' oder '(IDs: 124, 125)', wo angebracht.",
+            "summary_request": "Präzise Zusammenfassung:",
+            "processing_message": f"⏳ Abrufen und Zusammenfassen der letzten {actual_count} Nachrichten mit `{GEMINI_MODEL_NAME}`... bitte warten.",
+            "error_message": "❌ Hoppla! Beim Erstellen der Zusammenfassung ist ein Fehler aufgetreten. Bitte versuchen Sie es später erneut. Wenn das Problem weiterhin besteht, kontaktieren Sie den Bot-Administrator.",
+            "summary_header": f"✨ **Zusammenfassung der letzten {actual_count} Nachrichten (ca. ID {{}}-{{}}):** ✨\n\n",
+            "summary_footer": f"*Zusammenfassung erstellt von `{GEMINI_MODEL_NAME}`. Nachrichten-IDs dienen als Referenz.*"
+        }
+    }
+    
+    # Use English templates as fallback for unsupported languages
+    templates = prompt_templates.get(chat_lang, prompt_templates["en"])
+    
+    # Update processing message with language-specific version
+    try:
+        if processing_msg_id:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=processing_msg_id,
+                text=templates["processing_message"],
+                parse_mode=constants.ParseMode.MARKDOWN
+            )
+    except TelegramError as edit_err:
+        logger.warning(f"Failed to update processing message with language-specific version: {edit_err}")
+    
+    # Build the language-specific prompt
     prompt = (
-        "You are a helpful assistant tasked with summarizing Telegram group chat conversations.\n"
-        "Provide a *concise, neutral, and objective* summary of the following messages. "
-        "Focus on key discussion points, decisions made, questions asked, and any action items mentioned.\n"
-        "Format the summary clearly, perhaps using bullet points or numbered lists for readability.\n"
-        "If specific points are derived from messages, reference the original message ID(s) like '(ID: 123)' or '(IDs: 124, 125)' where appropriate.\n\n"
+        f"{templates['intro']}\n\n"
         "--- Conversation Start ---\n"
         f"{formatted_text}\n"
         "--- Conversation End ---\n\n"
-        "Concise Summary:"
+        f"{templates['summary_request']}"
     )
 
     summary_text = ""
     error_occurred = False
-    user_error_message = "❌ Oops! Something went wrong while generating the summary. Please try again later. If the problem persists, contact the bot admin."
+    user_error_message = templates["error_message"]
 
     try:
         generation_config = GenerationConfig() # Add specific config if needed
@@ -420,9 +575,9 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             first_msg_id = messages_to_summarize[0][0]
             last_msg_id = messages_to_summarize[-1][0]
             reply_text = (
-                f"✨ **Summary of last {actual_count} messages (approx. ID {first_msg_id} to {last_msg_id}):** ✨\n\n"
+                f"{templates['summary_header']}{first_msg_id}-{last_msg_id}\n\n"
                 f"{summary_text}\n\n"
-                f"*Summary generated by `{GEMINI_MODEL_NAME}`. Message IDs are for reference.*"
+                f"{templates['summary_footer']}"
             )
             await edit_or_reply_message(context, chat_id, reply_text, processing_msg_id, constants.ParseMode.MARKDOWN)
             logger.info(f"Successfully generated and sent summary for chat {chat_id} ({actual_count} messages) requested by user {user_id}.")
@@ -467,6 +622,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         message_data = (message_id, user_name, text, timestamp)
         message_cache[chat_id].append(message_data)
+        
+        # Update language detection every 10 messages
+        if len(message_cache[chat_id]) % 10 == 0 and len(message_cache[chat_id]) >= 10:
+            # Get the last 20 messages or however many are available
+            recent_messages = list(message_cache[chat_id])[-20:]
+            lang = detect_language(recent_messages)
+            if lang:
+                chat_language_cache[chat_id] = lang
+                logger.debug(f"Updated language for chat {chat_id} to {lang}")
     except Exception as cache_err:
         logger.error(f"Failed to cache message {message_id} for chat {chat_id}: {cache_err}", exc_info=True)
 

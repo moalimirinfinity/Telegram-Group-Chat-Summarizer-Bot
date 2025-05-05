@@ -10,6 +10,9 @@ google-generativeai==0.8.5
 # For loading environment variables from .env file
 python-dotenv==1.0.1
 
+# Language detection
+langdetect==1.0.9
+
 # HTTP client used by underlying libraries
 # Often good to pin, but sometimes needs flexibility based on other libs
 httpx>=0.27,<0.28
