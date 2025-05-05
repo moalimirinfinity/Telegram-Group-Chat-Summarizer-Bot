@@ -4,6 +4,8 @@ import os
 import asyncio
 import time
 import traceback
+import html # For escaping HTML in error handler
+import json # For potentially dumping update object
 import google.api_core.exceptions
 from collections import defaultdict, deque
 from datetime import datetime, timezone, timedelta
@@ -11,7 +13,6 @@ from datetime import datetime, timezone, timedelta
 # Third-party libraries
 import google.generativeai as genai
 # Import necessary types for v0.8.5+
-# Candidate class itself might not be needed for direct import if accessing via response
 from google.generativeai.types import (
     GenerationConfig, SafetySettingDict, HarmCategory, HarmBlockThreshold,
     BlockedPromptException, StopCandidateException
@@ -50,7 +51,6 @@ if not GEMINI_API_KEY:
 try:
     genai.configure(api_key=GEMINI_API_KEY)
     # Apply default safety settings suitable for general chat summarization
-    # Using BLOCK_MEDIUM_AND_ABOVE as a reasonable default
     default_safety_settings: SafetySettingDict = {
          HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
          HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
@@ -60,67 +60,55 @@ try:
     gemini_model = genai.GenerativeModel(
         model_name=GEMINI_MODEL_NAME,
         safety_settings=default_safety_settings
-        # Default generation config can also be set here if desired
-        # generation_config=GenerationConfig(temperature=0.7)
     )
-    # Quick check removed as it might consume quota unnecessarily during startup
     logging.info(f"Successfully configured Gemini AI with model: {GEMINI_MODEL_NAME}")
 except Exception as e:
     logging.critical(f"CRITICAL: Failed to configure or test Gemini AI: {e}", exc_info=True)
     import sys
     print(f"CRITICAL: Failed to configure Gemini: {e}", file=sys.stderr)
-    sys.exit(1) # Exit if core AI configuration fails
+    sys.exit(1)
 
 # Bot Configuration
 COMMAND_NAME = "summarize"
 DEFAULT_SUMMARY_MESSAGES = 25
-MAX_SUMMARY_MESSAGES = 200  # Limit to prevent abuse/long processing
-MESSAGE_CACHE_SIZE = 500    # Max messages to store per chat in memory
-SUMMARY_COOLDOWN_SECONDS = 60 # Cooldown per user for /summarize command
+MAX_SUMMARY_MESSAGES = 200
+MESSAGE_CACHE_SIZE = 500
+SUMMARY_COOLDOWN_SECONDS = 60
 
 # --- Logging Setup ---
-# Use ISO format for timestamps
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
-    datefmt='%Y-%m-%dT%H:%M:%S%z' # ISO 8601 format
+    datefmt='%Y-%m-%dT%H:%M:%S%z'
 )
-# Filter out excessive noise from underlying libraries
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("telegram.ext").setLevel(logging.INFO) # Keep INFO for connection status etc.
+logging.getLogger("telegram.ext").setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
 
 # --- In-Memory Caches ---
-# Stores recent messages per chat_id: {chat_id: deque([(message_id, user_name, text, timestamp), ...])}
 message_cache: dict[int, deque] = defaultdict(lambda: deque(maxlen=MESSAGE_CACHE_SIZE))
-# Stores last summary request time per user_id: {user_id: timestamp (monotonic)}
 user_last_summary_request: dict[int, float] = {}
 
 # --- Helper Functions ---
 
 def sanitize_for_prompt(text: str) -> str:
     """Basic sanitization for user names included in prompts."""
-    # Simple replacement to avoid markdown issues or potential injection points in names
     return text.replace('[', '(').replace(']', ')')
 
 def format_message_for_gemini(msg_data: tuple) -> str:
     """Formats a single message tuple for the Gemini prompt."""
     message_id, user_name, text, timestamp = msg_data
-    # Format timestamp in ISO 8601 UTC for clarity
     ts_str = timestamp.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     safe_user_name = sanitize_for_prompt(user_name)
-    # Ensure text is included, even if empty, to maintain structure
     text_content = text if text is not None else ""
     return f"[{ts_str} - {safe_user_name} (ID: {message_id})]: {text_content}"
 
 def format_messages_for_prompt(messages: list[tuple]) -> str:
     """Formats a list of message tuples into a single string for the Gemini prompt."""
-    # Consider adding a check or warning if the formatted string becomes excessively long
-    # (e.g., > 30k characters for Flash models) although the API might handle truncation.
     return "\n".join(format_message_for_gemini(msg) for msg in messages)
 
 async def edit_or_reply_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, processing_msg_id: int = None, parse_mode=None, disable_web_page_preview=True):
-    """Tries to edit a message, falls back to sending a new one if edit fails or no ID provided."""
+    """Tries to edit a message, falls back to sending a new one."""
     try:
         if processing_msg_id:
             await context.bot.edit_message_text(
@@ -130,14 +118,10 @@ async def edit_or_reply_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int
                 parse_mode=parse_mode,
                 disable_web_page_preview=disable_web_page_preview
             )
-            return # Success editing
-        # If no processing_msg_id, fall through to send new message
+            return
     except TelegramError as e:
-        # Log the edit failure specifically
         logger.error(f"Failed to edit message {processing_msg_id} in chat {chat_id}: {e}. Attempting to send new message instead.")
-        # Fall through to send new message
 
-    # Send a new message if editing wasn't attempted or failed
     try:
         await context.bot.send_message(
             chat_id=chat_id,
@@ -146,16 +130,14 @@ async def edit_or_reply_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int
             disable_web_page_preview=disable_web_page_preview
         )
     except TelegramError as send_err:
-        # Log failure to send even the new message
         logger.error(f"Failed even to send new message to chat {chat_id} after edit failed or wasn't applicable: {send_err}")
-
 
 # --- Telegram Command Handlers ---
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Sends explanation on /start or /help command."""
     if not update.message:
-        return # Should not happen for command handlers
+        return
 
     start_text = (
         "Hi! I'm a bot designed to summarize recent messages in this group.\n\n"
@@ -177,7 +159,7 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     """Handles the /summarize command to generate and send a summary."""
     if not update.message or not update.message.from_user or not update.message.chat:
         logger.warning("Summarize command received without essential message/user/chat info.")
-        return # Cannot proceed without core info
+        return
 
     message = update.message
     user = message.from_user
@@ -185,11 +167,9 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     chat_id = chat.id
     user_id = user.id
 
-    # 1. Check command origin (only groups/supergroups)
+    # 1. Check command origin
     if chat.type not in (constants.ChatType.GROUP, constants.ChatType.SUPERGROUP):
         logger.debug(f"Command '/{COMMAND_NAME}' ignored from non-group chat {chat_id} type {chat.type} by user {user_id}")
-        # Optionally reply in private chat that it only works in groups
-        # await context.bot.send_message(user_id, "Sorry, the /summarize command only works in group chats.")
         return
 
     # 2. Rate Limiting Check
@@ -202,14 +182,14 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         try:
             await message.reply_text(
                 f"⏳ Please wait {remaining} more seconds before requesting another summary.",
-                disable_notification=True, # Be less intrusive
+                disable_notification=True,
             )
         except TelegramError as e:
              logger.warning(f"Failed to send rate limit message to user {user_id} in chat {chat_id}: {e}")
         return
 
     # 3. Parse arguments
-    num_messages = DEFAULT_SUMMARY_MESSAGES # Default value
+    num_messages = DEFAULT_SUMMARY_MESSAGES
     if context.args:
         try:
             requested_num = int(context.args[0])
@@ -221,7 +201,6 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     f"Usage: `/{COMMAND_NAME} [number]` (Using default {DEFAULT_SUMMARY_MESSAGES})",
                      parse_mode=constants.ParseMode.MARKDOWN,
                 )
-                # Continue with default, but inform user
                 num_messages = DEFAULT_SUMMARY_MESSAGES
         except (ValueError, IndexError):
              await message.reply_text(
@@ -229,9 +208,7 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                  f"Usage: `/{COMMAND_NAME} [number]` (e.g., `/{COMMAND_NAME} 50`).",
                   parse_mode=constants.ParseMode.MARKDOWN,
              )
-             # Continue with default
              num_messages = DEFAULT_SUMMARY_MESSAGES
-    # If no args, num_messages remains DEFAULT_SUMMARY_MESSAGES
 
     # 4. Retrieve messages from cache
     chat_messages_deque = message_cache.get(chat_id)
@@ -243,20 +220,18 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return
 
-    # Create a snapshot for processing to avoid race conditions if cache updates during processing
-    with context.application._lock: # Use application lock for potential thread safety if needed elsewhere
-        chat_messages = list(chat_messages_deque)
+    # Create a snapshot for processing. The lock was removed as it's not standard/needed.
+    chat_messages = list(chat_messages_deque)
 
     if not chat_messages:
         logger.info(f"Message cache for chat {chat_id} is empty when user {user_id} requested summarization.")
         await message.reply_text("My message cache for this chat is currently empty. Please wait for new messages.")
         return
 
-    # Select the most recent N messages
     messages_to_summarize = chat_messages[-num_messages:]
     actual_count = len(messages_to_summarize)
 
-    if actual_count == 0: # Should be unlikely after previous checks, but good failsafe
+    if actual_count == 0:
         logger.warning(f"Attempted to summarize 0 messages for chat {chat_id} requested by {user_id}, despite non-empty cache.")
         await message.reply_text("No messages found in the specified range to summarize.")
         return
@@ -271,21 +246,16 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             disable_notification=True,
             parse_mode=constants.ParseMode.MARKDOWN
         )
-        # Store message ID for potential editing later
         processing_msg_id = processing_msg.message_id if processing_msg else None
     except TelegramError as send_err:
         logger.error(f"Failed to send 'processing' message to chat {chat_id} for user {user_id}: {send_err}")
-        # If we can't send status, we probably can't send the result either. Abort early.
         return
 
     # 6. Format prompt and call Gemini API
     formatted_text = format_messages_for_prompt(messages_to_summarize)
-    # Check length again, potentially adjusting based on newer model limits if known
-    if len(formatted_text) > 32000: # Example limit adjustment if needed for 1.5 flash/pro
+    if len(formatted_text) > 32000:
         logger.warning(f"Formatted text for chat {chat_id} exceeds 32,000 chars ({len(formatted_text)}). May be truncated by API or cause errors.")
-        # Optionally truncate here or inform user more clearly
 
-    # Define the prompt (could be moved to a constant or config)
     prompt = (
         "You are a helpful assistant tasked with summarizing Telegram group chat conversations.\n"
         "Provide a *concise, neutral, and objective* summary of the following messages. "
@@ -300,44 +270,32 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     summary_text = ""
     error_occurred = False
-    # Default error message, can be overridden by specific exceptions
     user_error_message = "❌ Oops! Something went wrong while generating the summary. Please try again later. If the problem persists, contact the bot admin."
 
     try:
-        # Configure generation parameters per-request if needed (e.g., temperature)
-        generation_config = GenerationConfig(
-            # temperature=0.7,
-            # max_output_tokens=1024, # Limit summary length if desired
-        )
+        generation_config = GenerationConfig() # Add specific config if needed
 
-        # Run blocking API call in a separate thread to avoid blocking the event loop
         response = await asyncio.to_thread(
             gemini_model.generate_content,
             prompt,
             generation_config=generation_config,
-            # Safety settings are usually set at model level, but can be overridden here
-            # request_options={'timeout': 60} # Set API call timeout if needed
         )
 
         # --- Refined Response Handling (for v0.8.5+) ---
         if not response.candidates:
              block_reason = "Unknown reason (No candidates)"
-             # Safely access prompt_feedback and block_reason
              prompt_feedback = getattr(response, 'prompt_feedback', None)
              if prompt_feedback and hasattr(prompt_feedback, 'block_reason'):
                  block_reason_enum = getattr(prompt_feedback, 'block_reason', None)
-                 block_reason = getattr(block_reason_enum, 'name', str(block_reason_enum)) # Get name if enum, else string
+                 block_reason = getattr(block_reason_enum, 'name', str(block_reason_enum))
              logger.warning(f"Summary generation blocked for chat {chat_id} by user {user_id}. Reason: {block_reason}. Prompt length: {len(prompt)}. Feedback: {prompt_feedback}")
              user_error_message = f"❌ Summary generation failed. The request was blocked, possibly due to safety filters ({block_reason}). Please revise the conversation if sensitive content is present."
              raise BlockedPromptException(f"Blocked prompt: {block_reason}")
 
-        candidate = response.candidates[0] # Assume at least one candidate if not blocked
+        candidate = response.candidates[0]
+        finish_reason = getattr(candidate, 'finish_reason', None)
 
         # --- Standard Enum Check (for v0.8.5+) ---
-        finish_reason = getattr(candidate, 'finish_reason', None) # Safely get finish_reason
-
-        # Compare finish_reason against known enum values
-        # Make sure genai.types.FinishReason is the correct path in v0.8.5
         if finish_reason == genai.types.FinishReason.SAFETY:
             safety_ratings = getattr(candidate, 'safety_ratings', [])
             safety_ratings_str = ", ".join([f"{rating.category.name}: {rating.probability.name}" for rating in safety_ratings])
@@ -353,46 +311,41 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
              raise StopCandidateException("Recitation stop")
 
         elif finish_reason not in [genai.types.FinishReason.STOP, genai.types.FinishReason.MAX_TOKENS]:
-             finish_reason_name = getattr(finish_reason, 'name', 'UNKNOWN') # Safely get enum name
+             finish_reason_name = getattr(finish_reason, 'name', 'UNKNOWN')
              logger.warning(f"Summary generation finished unexpectedly for chat {chat_id} requested by {user_id}. Reason: {finish_reason_name}")
              user_error_message = f"❌ Summary generation finished unexpectedly ({finish_reason_name}). Please try again."
              raise StopCandidateException(f"Unexpected finish: {finish_reason_name}")
         # --- End of Standard Enum Check ---
 
-        # Get the text content safely
         content = getattr(candidate, 'content', None)
         parts = getattr(content, 'parts', []) if content else []
 
         if not parts:
-             finish_reason_name = getattr(finish_reason, 'name', 'UNKNOWN') # Use already retrieved finish_reason
+             finish_reason_name = getattr(finish_reason, 'name', 'UNKNOWN')
              logger.warning(f"Gemini API returned no content parts for chat {chat_id} requested by {user_id}. Finish Reason: {finish_reason_name}. Response: {response}")
              user_error_message = "❌ Summary generation resulted in no content. This might be due to filtering or an API issue. Please try again later."
              raise ValueError("Received no content/parts from API.")
 
-        # Assuming text is in the first part if parts exist
         text_part = getattr(parts[0], 'text', None)
-        if text_part is None: # Check specifically for None, allowing empty strings
+        if text_part is None:
              finish_reason_name = getattr(finish_reason, 'name', 'UNKNOWN')
              logger.warning(f"Gemini API returned empty text in content part for chat {chat_id} requested by {user_id}. Finish Reason: {finish_reason_name}. Response: {response}")
              user_error_message = "❌ Summary generation resulted in empty content. This might be due to filtering or an API issue. Please try again later."
              raise ValueError("Received empty text part from API.")
 
-        summary_text = text_part.strip() # Strip whitespace from the result
+        summary_text = text_part.strip()
 
-        # Final check if the summary is empty after stripping
         if not summary_text:
              logger.warning(f"Gemini API returned whitespace-only summary for chat {chat_id} requested by {user_id}.")
              user_error_message = "❌ Summary generation resulted in an empty summary after processing."
-             error_occurred = True # Treat as error for sending message logic
+             error_occurred = True
 
-        # If successful *and* summary text is not empty, update rate limit timestamp
         if not error_occurred and summary_text:
             user_last_summary_request[user_id] = time.monotonic()
 
     # --- Exception Handling ---
     except (BlockedPromptException, StopCandidateException) as safety_exception:
-        # Specific exceptions caught above, user message already set
-        logger.error(f"{type(safety_exception).__name__} during summary for chat {chat_id}, user {user_id}: {safety_exception}", exc_info=False) # No need for full traceback here
+        logger.error(f"{type(safety_exception).__name__} during summary for chat {chat_id}, user {user_id}: {safety_exception}", exc_info=False)
         error_occurred = True
 
     except google.api_core.exceptions.InternalServerError as gemini_ise:
@@ -401,7 +354,6 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         error_occurred = True
 
     except google.api_core.exceptions.GoogleAPIError as api_error:
-        # Catch other Google API errors (authentication, timeouts, quotas, etc.)
         logger.error(f"Google API Error during summary for chat {chat_id}, user {user_id}: {api_error}", exc_info=True)
         if isinstance(api_error, google.api_core.exceptions.PermissionDenied):
              user_error_message = "❌ Permission denied by the summarization service. Please check the API key and project settings."
@@ -409,39 +361,33 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
              user_error_message = "❌ The request to the summarization service timed out. Please try again later."
         elif isinstance(api_error, google.api_core.exceptions.Unauthenticated):
              user_error_message = "❌ Authentication error with the summarization service. Please notify the bot admin."
-        elif isinstance(api_error, google.api_core.exceptions.ResourceExhausted): # 429 Too Many Requests
+        elif isinstance(api_error, google.api_core.exceptions.ResourceExhausted):
              user_error_message = "❌ Rate limit exceeded for the summarization service. Please wait and try again."
-        else: # Catch-all for other Google API errors
+        else:
              user_error_message = f"❌ A Google API error occurred ({type(api_error).__name__}). Please notify the bot admin."
         error_occurred = True
 
-    except ValueError as val_err: # Catch specific ValueErrors raised during response processing
+    except ValueError as val_err:
         logger.error(f"ValueError during summary processing for chat {chat_id}, user {user_id}: {val_err}", exc_info=False)
-        # user_error_message is already set when the error was raised
         error_occurred = True
 
     except Exception as e:
-        # Catch any other unexpected Python errors during summary generation
         logger.error(f"Unexpected Python error during summary generation/processing for chat {chat_id}, user {user_id}: {e}", exc_info=True)
-        # Keep the default generic user_error_message
         error_occurred = True
-        # Notify admin if configured
         if ADMIN_CHAT_ID:
             try:
-                # Send a concise error report to admin
                 error_details = (
                     f"Unexpected error in summarize_command for chat {chat_id}, user {user_id}:\n"
                     f"Type: {type(e).__name__}\nError: {e}\n"
-                    f"Traceback:\n{traceback.format_exc(limit=5)}" # Limit traceback depth
+                    f"Traceback:\n{traceback.format_exc(limit=5)}"
                 )
-                await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=error_details[:4000]) # Limit message length
+                # Send plain text to admin to avoid parsing errors
+                await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=error_details[:4000])
             except Exception as notify_err:
                 logger.error(f"Failed to send error notification to admin {ADMIN_CHAT_ID}: {notify_err}")
 
     # 7. Send Result or Error Message
-    # This block executes regardless of whether an error occurred above
     if not error_occurred and summary_text:
-        # Success path: Construct and send the summary
         try:
             first_msg_id = messages_to_summarize[0][0]
             last_msg_id = messages_to_summarize[-1][0]
@@ -453,29 +399,21 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await edit_or_reply_message(context, chat_id, reply_text, processing_msg_id, constants.ParseMode.MARKDOWN)
             logger.info(f"Successfully generated and sent summary for chat {chat_id} ({actual_count} messages) requested by user {user_id}.")
         except Exception as final_send_err:
-            # Log error even during final message sending/editing attempt
             logger.error(f"Error sending final summary message for chat {chat_id}: {final_send_err}", exc_info=True)
-            # Optionally try sending a simple error message if the summary send failed
             await edit_or_reply_message(context, chat_id, "❌ Error displaying the summary.", processing_msg_id)
 
     elif error_occurred:
-        # Error path: Send the specific user_error_message determined during exception handling
         await edit_or_reply_message(context, chat_id, user_error_message, processing_msg_id)
         logger.warning(f"Summary failed for chat {chat_id} requested by user {user_id}. Sent error/info message to user.")
-    # Implicit else: If no error occurred but summary_text ended up empty (whitespace only), the warning is logged,
-    # and the user_error_message for that case is sent.
-
 
 # --- Message Handler ---
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Stores incoming text messages from groups/supergroups in the cache."""
     if not update.message or not update.message.text or update.message.via_bot:
-        # Ignore non-text messages, messages without text, or messages from bots
         return
 
     chat = update.message.chat
-    # Only cache messages from group chats
     if chat.type not in (constants.ChatType.GROUP, constants.ChatType.SUPERGROUP):
         return
 
@@ -483,65 +421,76 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user = update.message.from_user
     message = update.message
 
-    # Determine user name safely
     if not user:
-        user_name = "Anonymous" # Handle cases like anonymous admins
+        user_name = "Anonymous"
     else:
         user_name = user.first_name.strip() if user.first_name else ""
         if not user_name and user.username:
             user_name = user.username.strip()
-        if not user_name: # Fallback if no first name or username
+        if not user_name:
             user_name = f"User_{user.id}"
 
     message_id = message.message_id
     text = message.text
-    # Ensure timestamp is timezone-aware UTC
     timestamp = message.date if message.date else datetime.now(timezone.utc)
     if timestamp.tzinfo is None:
          timestamp = timestamp.replace(tzinfo=timezone.utc)
 
-    # Add message data tuple to this chat's cache deque
     try:
         message_data = (message_id, user_name, text, timestamp)
-        # defaultdict automatically creates deque if it doesn't exist
         message_cache[chat_id].append(message_data)
-        # Optional: Debug log for frequent cache monitoring
-        # logger.debug(f"Cached msg {message_id} from '{user_name}' in chat {chat_id}. Cache size: {len(message_cache[chat_id])}")
     except Exception as cache_err:
         logger.error(f"Failed to cache message {message_id} for chat {chat_id}: {cache_err}", exc_info=True)
-
 
 # --- Error Handler ---
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Log Errors caused by Updates and notify admin if configured."""
-    # Log the error with traceback
     logger.error(f"Exception while handling an update: {context.error}", exc_info=context.error)
 
-    # Notify admin if configured
     if ADMIN_CHAT_ID:
         try:
             # Format a concise error message for admin
-            tb_list = traceback.format_exception(None, context.error, context.error.__traceback__, limit=5) # Limit traceback depth
+            tb_list = traceback.format_exception(None, context.error, context.error.__traceback__, limit=5)
             tb_string = "".join(tb_list)
-            # Try to get update details safely
-            update_str = str(update) if update else "N/A"
+
+            # Try to get update details safely, converting to dict if possible
+            update_str = "N/A"
+            if isinstance(update, Update):
+                try:
+                    # Convert Update to dict, then to JSON string for safer display
+                    update_dict = update.to_dict()
+                    update_str = json.dumps(update_dict, indent=2, ensure_ascii=False, default=str) # Use default=str for non-serializable objects
+                except Exception as json_err:
+                    logger.warning(f"Could not serialize update object to JSON: {json_err}")
+                    update_str = str(update) # Fallback to string representation
+            elif update:
+                update_str = str(update)
+
             error_message = (
                 f"⚠️ BOT ERROR ⚠️\n\n"
                 f"Error Type: {type(context.error).__name__}\n"
-                f"Error: {context.error}\n\n"
-                f"Update: {update_str[:500]}...\n\n" # Limit update string length
-                f"Traceback (limited):\n```\n{tb_string[:3000]}\n```" # Limit traceback length
+                f"Error: {html.escape(str(context.error))}\n\n" # Escape potential HTML in error message
+                f"Update (limited):\n<pre>{html.escape(update_str[:500])}...</pre>\n\n" # Use <pre> and escape update string
+                f"Traceback (limited):\n<pre>{html.escape(tb_string[:3000])}</pre>" # Use <pre> and escape traceback
             )
-            # Send error to admin chat, ensuring it fits within Telegram limits
+
+            # Send error to admin chat using HTML parse mode for <pre> tags
             await context.bot.send_message(
                 chat_id=ADMIN_CHAT_ID,
                 text=error_message[:4096], # Telegram message length limit
-                parse_mode=constants.ParseMode.MARKDOWN
+                parse_mode=constants.ParseMode.HTML # Use HTML for <pre> tags
             )
         except Exception as notify_err:
-            # Log failure to notify admin
             logger.error(f"CRITICAL: Failed to send error notification to admin {ADMIN_CHAT_ID}: {notify_err}")
+            # Fallback: Try sending a very basic plain text notification if the formatted one failed
+            try:
+                await context.bot.send_message(
+                    chat_id=ADMIN_CHAT_ID,
+                    text=f"BOT ERROR: {type(context.error).__name__} - {context.error}. Check logs for details."
+                )
+            except Exception as fallback_err:
+                 logger.error(f"CRITICAL: Failed even to send fallback error notification to admin: {fallback_err}")
 
 
 # --- Main Application Setup ---
@@ -559,35 +508,22 @@ def main() -> None:
     else:
         logger.warning("ADMIN_CHAT_ID not set. Error notifications will not be sent via Telegram.")
 
-    # Create the Telegram Application using ApplicationBuilder
-    # Consider adding persistence later if needed (e.g., PicklePersistence)
     builder = ApplicationBuilder().token(TELEGRAM_TOKEN)
-    # Optional: Configure connection pool size for potentially high load
-    # builder.connection_pool_size(512)
-    # Optional: Increase connect/read timeouts if experiencing frequent timeout errors
-    # builder.connect_timeout(10.0).read_timeout(30.0)
     application = builder.build()
 
-    # Register command handlers
     application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", start_command)) # Alias help to start
+    application.add_handler(CommandHandler("help", start_command))
     application.add_handler(CommandHandler(COMMAND_NAME, summarize_command))
 
-    # Register message handler for caching relevant messages
-    # Filters: TEXT only, not a command, only in groups/supergroups, not via another bot
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS & ~filters.VIA_BOT,
         handle_message
     ))
 
-    # Register the global error handler
     application.add_error_handler(error_handler)
 
-    # Start polling for updates
     logger.info("Bot polling started...")
-    # Specify allowed updates to potentially improve efficiency if needed
-    # application.run_polling(allowed_updates=[Update.MESSAGE], drop_pending_updates=True)
-    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True) # Process all types
+    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
     logger.info("--- Bot polling stopped ---")
 
