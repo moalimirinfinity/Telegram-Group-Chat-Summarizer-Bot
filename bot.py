@@ -155,10 +155,24 @@ def detect_language(messages: list[tuple]) -> str:
         return "en"  # Default to English on detection error
 
 def create_message_link(chat_id: int, message_id: int) -> str:
-    """Create a direct link to a message in a Telegram chat."""
-    # Format for private/regular groups (may not work for all groups)
-    # Convert chat_id to positive if it's negative (for supergroups)
-    chat_id_str = str(abs(chat_id))
+    """Create a direct link to a message in a Telegram chat.
+    
+    Note: For these links to work:
+    1. The bot must be in a supergroup
+    2. The chat must have a username or be a public group
+    3. For private groups, links may not work for all users
+    """
+    # For supergroups, we need to convert the chat_id to a special format
+    # Telegram uses a format where the ID needs to be modified
+    if chat_id < 0:
+        # Remove the negative sign and first number (usually -100)
+        # But keep all digits for newer supergroups which may have a different prefix
+        chat_id_str = str(abs(chat_id))
+        if chat_id_str.startswith('100'):
+            chat_id_str = chat_id_str[3:]  # Remove '100' prefix for supergroups
+    else:
+        chat_id_str = str(chat_id)
+        
     return f"https://t.me/c/{chat_id_str}/{message_id}"
 
 def add_message_links(summary: str, chat_id: int) -> str:
@@ -402,7 +416,7 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             "processing_message": f"⏳ Fetching and summarizing the last {actual_count} cached messages using AI... please wait.",
             "error_message": "❌ Oops! Something went wrong while generating the summary. Please try again later. If the problem persists, contact the bot admin.",
             "summary_header": f"**✨ SUMMARY OF RECENT MESSAGES ✨**\n\n",
-            "summary_footer": ""
+            "summary_footer": "\n\n*Note: Message links work in supergroups and public groups. In private groups, links may not work for all users.*"
         },
         "es": {
             "intro": "Eres un asistente útil encargado de resumir conversaciones de grupo de Telegram.\n"
@@ -417,7 +431,7 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             "processing_message": f"⏳ Obteniendo y resumiendo los últimos {actual_count} mensajes usando IA... por favor espera.",
             "error_message": "❌ ¡Ups! Algo salió mal al generar el resumen. Por favor, inténtalo de nuevo más tarde. Si el problema persiste, contacta al administrador del bot.",
             "summary_header": f"**✨ RESUMEN DE MENSAJES RECIENTES ✨**\n\n",
-            "summary_footer": ""
+            "summary_footer": "\n\n*Nota: Los enlaces a mensajes funcionan en supergrupos y grupos públicos. En grupos privados, es posible que los enlaces no funcionen para todos los usuarios.*"
         },
         "ru": {
             "intro": "Вы - полезный ассистент, которому поручено обобщать групповые чаты Telegram.\n"
@@ -432,7 +446,7 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             "processing_message": f"⏳ Получение и составление резюме последних {actual_count} сообщений с использованием ИИ... пожалуйста, подождите.",
             "error_message": "❌ Упс! Что-то пошло не так при генерации резюме. Пожалуйста, повторите попытку позже. Если проблема не исчезнет, обратитесь к администратору бота.",
             "summary_header": f"**✨ РЕЗЮМЕ НЕДАВНИХ СООБЩЕНИЙ ✨**\n\n",
-            "summary_footer": ""
+            "summary_footer": "\n\n*Примечание: Ссылки на сообщения работают в супергруппах и публичных группах. В приватных группах ссылки могут работать не для всех пользователей.*"
         },
         "fr": {
             "intro": "Vous êtes un assistant utile chargé de résumer les conversations de groupe Telegram.\n"
@@ -447,7 +461,7 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             "processing_message": f"⏳ Récupération et résumé des {actual_count} derniers messages avec IA... veuillez patienter.",
             "error_message": "❌ Oups! Une erreur s'est produite lors de la génération du résumé. Veuillez réessayer plus tard. Si le problème persiste, contactez l'administrateur du bot.",
             "summary_header": f"**✨ RÉSUMÉ DES MESSAGES RÉCENTS ✨**\n\n",
-            "summary_footer": ""
+            "summary_footer": "\n\n*Remarque: Les liens vers les messages fonctionnent dans les supergroupes et les groupes publics. Dans les groupes privés, les liens peuvent ne pas fonctionner pour tous les utilisateurs.*"
         },
         "de": {
             "intro": "Sie sind ein hilfreicher Assistent, der Telegram-Gruppenchats zusammenfasst.\n"
@@ -462,7 +476,7 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             "processing_message": f"⏳ Abrufen und Zusammenfassen der letzten {actual_count} Nachrichten mit KI... bitte warten.",
             "error_message": "❌ Hoppla! Beim Erstellen der Zusammenfassung ist ein Fehler aufgetreten. Bitte versuchen Sie es später erneut. Wenn das Problem weiterhin besteht, kontaktieren Sie den Bot-Administrator.",
             "summary_header": f"**✨ ZUSAMMENFASSUNG DER LETZTEN NACHRICHTEN ✨**\n\n",
-            "summary_footer": ""
+            "summary_footer": "\n\n*Hinweis: Nachrichtenlinks funktionieren in Supergruppen und öffentlichen Gruppen. In privaten Gruppen funktionieren Links möglicherweise nicht für alle Benutzer.*"
         }
     }
     
