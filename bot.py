@@ -42,6 +42,8 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-1.5-flash")
 # Optional: Admin user ID for receiving critical error notifications
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
+# API timeout in seconds (default: 30 seconds)
+API_TIMEOUT_SECONDS = int(os.getenv("API_TIMEOUT_SECONDS", "30"))
 
 
 if not TELEGRAM_TOKEN:
@@ -91,6 +93,8 @@ logger = logging.getLogger(__name__)
 message_cache: dict[int, deque] = defaultdict(lambda: deque(maxlen=MESSAGE_CACHE_SIZE))
 user_last_summary_request: dict[int, float] = {}
 chat_language_cache: dict[int, str] = {}  # Store detected language by chat_id
+last_cache_cleanup: float = time.monotonic()  # Time tracker for periodic cache cleanup
+CACHE_CLEANUP_INTERVAL = 3600  # Clean up old entries once per hour (in seconds)
 
 # --- Helper Functions ---
 
@@ -136,85 +140,111 @@ async def edit_or_reply_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int
         logger.error(f"Failed even to send new message to chat {chat_id} after edit failed or wasn't applicable: {send_err}")
 
 def detect_language(messages: list[tuple]) -> str:
-    """Detect the most common language in a list of messages, supporting only English and Persian."""
+    """Detect the most common language in a list of messages, supporting only English and Persian.
+    Uses a weighted approach with confidence threshold for more reliable detection."""
     if not messages:
         return "en"  # Default to English if no messages
     
-    # Concatenate all message texts with spaces
-    all_text = " ".join([msg[2] for msg in messages if msg[2] and len(msg[2]) > 5])
+    # Collect texts with adequate length (longer texts are more reliable for detection)
+    filtered_texts = [msg[2] for msg in messages if msg[2] and len(msg[2]) > 10]
     
     # Return English if not enough text to detect
-    if len(all_text) < 20:
+    if not filtered_texts or sum(len(text) for text in filtered_texts) < 50:
         return "en"
         
+    # Concatenate all messages into a single string for more accurate detection
+    all_text = " ".join(filtered_texts)
+    
+    # Track detection attempts
+    detection_attempts = []
+    
     try:
-        # Detect language
-        detected = detect(all_text)
+        # Use langdetect with profile analysis for better accuracy
+        from langdetect import detect_langs
         
-        # Map Persian/Farsi variations to "fa", everything else to "en"
+        # Try to detect with full text first
+        lang_results = detect_langs(all_text)
+        
+        # Check if Persian is detected with good confidence
+        for lang in lang_results:
+            if lang.lang in ["fa", "per", "pes", "ira"] and lang.prob > 0.5:
+                logger.info(f"Detected Persian language with {lang.prob:.2f} confidence")
+                return "fa"
+            detection_attempts.append((lang.lang, lang.prob))
+                
+        # If no clear Persian detection but the top result is Persian with any confidence
+        top_lang = lang_results[0] if lang_results else None
+        if top_lang and top_lang.lang in ["fa", "per", "pes", "ira"]:
+            logger.info(f"Detected Persian as top language with {top_lang.prob:.2f} confidence")
+            return "fa"
+            
+        # Fall back to standard detection if needed
+        detected = detect(all_text)
         if detected in ["fa", "per", "pes", "ira"]:
-            logger.info(f"Detected Persian language: {detected}")
+            logger.info(f"Detected Persian language using fallback method")
             return "fa"
         else:
-            logger.info(f"Detected language: {detected}, using English")
+            logger.info(f"Detected non-Persian language: {detected}, using English. Attempts: {detection_attempts}")
             return "en"
     except LangDetectException as e:
         logger.warning(f"Language detection error: {e}")
         return "en"  # Default to English on detection error
+    except Exception as e:
+        logger.warning(f"Unexpected error in language detection: {e}")
+        return "en"  # Default to English on any error
 
-def create_message_link(chat_id: int, message_id: int) -> str:
-    """Create a direct link to a message in a Telegram chat.
+def cleanup_old_cache_entries() -> None:
+    """Periodically clean up old entries from caches to prevent memory growth."""
+    global last_cache_cleanup
     
-    Note: For these links to work:
-    1. The bot must be in a supergroup
-    2. The chat must have a username or be a public group
-    3. For private groups, links may not work for all users
-    """
-    # For supergroups, we need to convert the chat_id to a special format
-    # Telegram uses a format where the ID needs to be modified
-    if chat_id < 0:
-        # Remove the negative sign and first number (usually -100)
-        # But keep all digits for newer supergroups which may have a different prefix
-        chat_id_str = str(abs(chat_id))
-        if chat_id_str.startswith('100'):
-            chat_id_str = chat_id_str[3:]  # Remove '100' prefix for supergroups
-    else:
-        chat_id_str = str(chat_id)
+    # Only run cleanup if enough time has passed since last cleanup
+    now = time.monotonic()
+    if now - last_cache_cleanup < CACHE_CLEANUP_INTERVAL:
+        return
         
-    return f"https://t.me/c/{chat_id_str}/{message_id}"
-
-def add_message_links(summary: str, chat_id: int) -> str:
-    """Replace message ID references with clickable links."""
-    # Match patterns like [Message 123] or [Messages 123, 124, 125]
-    import re
-    
-    # Handle single message references - [Message 123]
-    def replace_single_msg(match):
-        msg_id = int(match.group(1))
-        return f"[Message {msg_id}]({create_message_link(chat_id, msg_id)})"
-    
-    # Handle multiple message references - [Messages 123, 124, 125]
-    def replace_multi_msg(match):
-        msg_ids_str = match.group(1)
-        msg_ids = [id.strip() for id in msg_ids_str.split(',')]
-        links = []
-        for msg_id in msg_ids:
+    try:
+        # Clean up user rate limiting cache - remove entries older than 2 hours
+        cleanup_threshold = now - 7200  # 2 hours in seconds
+        users_to_remove = [
+            user_id for user_id, timestamp in user_last_summary_request.items() 
+            if timestamp < cleanup_threshold
+        ]
+        for user_id in users_to_remove:
+            user_last_summary_request.pop(user_id, None)
+            
+        # Clean up empty caches or those for inactive chats (no messages in 24 hours)
+        inactive_threshold = time.time() - 86400  # 24 hours in seconds
+        chats_to_remove = []
+        for chat_id, msg_deque in message_cache.items():
+            if not msg_deque:  # Empty cache
+                chats_to_remove.append(chat_id)
+                continue
+                
+            # Get timestamp of last message (if available)
             try:
-                msg_id_int = int(msg_id)
-                links.append(f"[{msg_id}]({create_message_link(chat_id, msg_id_int)})")
-            except ValueError:
-                links.append(msg_id)
-        return f"[Messages {', '.join(links)}]"
-    
-    # English pattern
-    summary = re.sub(r'\[Message (\d+)\]', lambda m: replace_single_msg(m), summary)
-    summary = re.sub(r'\[Messages ([\d\s,]+)\]', lambda m: replace_multi_msg(m), summary)
-    
-    # Persian pattern
-    summary = re.sub(r'\[پیام (\d+)\]', lambda m: replace_single_msg(m), summary)
-    summary = re.sub(r'\[پیام‌های ([\d\s,،]+)\]', lambda m: replace_multi_msg(m), summary)
-    
-    return summary
+                last_msg = msg_deque[-1]
+                if len(last_msg) >= 4:  # Ensure tuple has timestamp field
+                    last_timestamp = last_msg[3]  # Access the timestamp
+                    if isinstance(last_timestamp, datetime):
+                        # Convert to epoch seconds for comparison
+                        last_activity = last_timestamp.timestamp()
+                        if last_activity < inactive_threshold:
+                            chats_to_remove.append(chat_id)
+            except (IndexError, TypeError, AttributeError) as e:
+                logger.debug(f"Error checking message cache timestamps for chat {chat_id}: {e}")
+        
+        # Remove inactive chats from all caches
+        for chat_id in chats_to_remove:
+            message_cache.pop(chat_id, None)
+            chat_language_cache.pop(chat_id, None)
+            
+        if users_to_remove or chats_to_remove:
+            logger.info(f"Cache cleanup: removed {len(users_to_remove)} user entries and {len(chats_to_remove)} chat entries")
+            
+        # Update last cleanup time
+        last_cache_cleanup = now
+    except Exception as e:
+        logger.error(f"Error during cache cleanup: {e}", exc_info=True)
 
 # --- Telegram Command Handlers ---
 
@@ -292,27 +322,50 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
              logger.warning(f"Failed to send rate limit message to user {user_id} in chat {chat_id}: {e}")
         return
 
-    # 3. Parse arguments
+    # 3. Parse arguments with improved validation
     num_messages = DEFAULT_SUMMARY_MESSAGES
     if context.args:
         try:
-            requested_num = int(context.args[0])
-            if 0 < requested_num <= MAX_SUMMARY_MESSAGES:
-                num_messages = requested_num
-            else:
+            arg = context.args[0].strip()
+            
+            # Check for non-numeric inputs
+            if not arg.isdigit():
+                raise ValueError(f"Non-numeric argument: {arg}")
+                
+            requested_num = int(arg)
+            
+            # Validate range
+            if requested_num <= 0:
                 await message.reply_text(
-                    f"Please provide a number between 1 and {MAX_SUMMARY_MESSAGES}. "
-                    f"Usage: `/{COMMAND_NAME} [number]` (Using default {DEFAULT_SUMMARY_MESSAGES})",
-                     parse_mode=constants.ParseMode.MARKDOWN,
+                    f"Please provide a number greater than 0. "
+                    f"Using default {DEFAULT_SUMMARY_MESSAGES} messages.",
+                    parse_mode=constants.ParseMode.MARKDOWN,
                 )
                 num_messages = DEFAULT_SUMMARY_MESSAGES
-        except (ValueError, IndexError):
-             await message.reply_text(
-                 f"Invalid number format. Using default {DEFAULT_SUMMARY_MESSAGES}. "
-                 f"Usage: `/{COMMAND_NAME} [number]` (e.g., `/{COMMAND_NAME} 50`).",
-                  parse_mode=constants.ParseMode.MARKDOWN,
-             )
-             num_messages = DEFAULT_SUMMARY_MESSAGES
+            elif requested_num > MAX_SUMMARY_MESSAGES:
+                await message.reply_text(
+                    f"The maximum allowed is {MAX_SUMMARY_MESSAGES} messages. "
+                    f"Using {MAX_SUMMARY_MESSAGES} messages.",
+                    parse_mode=constants.ParseMode.MARKDOWN,
+                )
+                num_messages = MAX_SUMMARY_MESSAGES
+            else:
+                num_messages = requested_num
+                
+            logger.debug(f"User {user_id} requested summary of {num_messages} messages in chat {chat_id}")
+                
+        except ValueError as e:
+            logger.debug(f"Invalid number format from user {user_id} in chat {chat_id}: {e}")
+            await message.reply_text(
+                f"Invalid number format. Using default {DEFAULT_SUMMARY_MESSAGES}. "
+                f"Usage: `/{COMMAND_NAME} [number]` (e.g., `/{COMMAND_NAME} 50`).",
+                parse_mode=constants.ParseMode.MARKDOWN,
+            )
+            num_messages = DEFAULT_SUMMARY_MESSAGES
+        except IndexError:
+            # This shouldn't normally happen if context.args exists
+            logger.warning(f"Unexpected IndexError when parsing args from user {user_id} in chat {chat_id}")
+            num_messages = DEFAULT_SUMMARY_MESSAGES
 
     # 4. Retrieve messages from cache
     chat_messages_deque = message_cache.get(chat_id)
@@ -371,33 +424,35 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     prompt_templates = {
         "en": {
             "intro": "You are a helpful assistant tasked with summarizing Telegram group chat conversations.\n"
-                    "Provide a *concise, neutral, and well-structured* summary of the following messages. "
-                    "Focus on key discussion points, decisions made, questions asked, and any action items mentioned.\n"
-                    "Format the summary clearly using bullet points or numbered lists for better readability.\n"
-                    "Organize the content by topics or themes and use formatting to create a structured summary.\n"
-                    "When referencing specific messages, use the message ID in a reference like '[Message 123]' at the end of the relevant point.\n"
-                    "If multiple messages discuss the same point, group them like '[Messages 123, 124, 125]'.\n"
-                    "Keep these references minimal and only for important points that users might want to find in the original chat.",
+                    "Provide a *concise, well-structured, and clearly formatted* summary of the following messages. "
+                    "Focus on key discussion points, decisions made, questions asked, and any action items mentioned.\n\n"
+                    "Structure your summary as follows:\n"
+                    "1. Start with a very brief overall summary in 1-2 sentences\n"
+                    "2. Organize content into clearly labeled topics or themes using bold headings with emoji prefixes\n"
+                    "3. Under each topic, use bullet points to list key points\n"
+                    "4. Format important information, names, and numbers in *bold* or _italic_ for emphasis\n\n"
+                    "DO NOT reference message IDs or include citations. Focus only on summarizing the content in a readable, well-structured format.",
             "summary_request": "Concise Summary:",
             "processing_message": f"⏳ Fetching and summarizing the last {actual_count} cached messages using AI... please wait.",
             "error_message": "❌ Oops! Something went wrong while generating the summary. Please try again later. If the problem persists, contact the bot admin.",
             "summary_header": f"**✨ SUMMARY OF RECENT MESSAGES ✨**\n\n",
-            "summary_footer": "\n\n*Note: Message links work in supergroups and public groups. In private groups, links may not work for all users.*"
+            "summary_footer": ""
         },
         "fa": {
             "intro": "شما یک دستیار هوشمند هستید که وظیفه خلاصه‌سازی گفتگوهای گروهی تلگرام را دارید.\n"
-                    "یک خلاصه *موجز، بی‌طرفانه، و ساختار یافته* از پیام‌های زیر ارائه دهید. "
-                    "بر نکات کلیدی بحث، تصمیمات گرفته شده، سؤالات مطرح شده، و هرگونه موارد عملی ذکر شده تمرکز کنید.\n"
-                    "خلاصه را به وضوح با استفاده از نقاط گلوله‌ای یا لیست‌های شماره‌دار برای خوانایی بهتر قالب‌بندی کنید.\n"
-                    "محتوا را بر اساس موضوعات سازماندهی کنید و از قالب‌بندی برای ایجاد یک خلاصه ساختار یافته استفاده کنید.\n"
-                    "هنگام اشاره به پیام‌های خاص، از شناسه پیام در قالب '[پیام 123]' در انتهای نکته مربوطه استفاده کنید.\n"
-                    "اگر چندین پیام درباره یک نکته بحث می‌کنند، آنها را مانند '[پیام‌های 123، 124، 125]' گروه‌بندی کنید.\n"
-                    "این ارجاعات را حداقل نگه دارید و فقط برای نکات مهمی که کاربران ممکن است بخواهند در گفتگوی اصلی پیدا کنند استفاده کنید.",
+                    "یک خلاصه *موجز، ساختارمند و به خوبی قالب‌بندی شده* از پیام‌های زیر ارائه دهید. "
+                    "بر نکات کلیدی بحث، تصمیمات گرفته شده، سؤالات مطرح شده، و هرگونه موارد عملی ذکر شده تمرکز کنید.\n\n"
+                    "خلاصه خود را به این شکل ساختاربندی کنید:\n"
+                    "1. با یک خلاصه کلی و بسیار مختصر در 1-2 جمله شروع کنید\n"
+                    "2. محتوا را به موضوعات یا تم‌های مشخص با عناوین پررنگ و ایموجی مناسب سازماندهی کنید\n"
+                    "3. زیر هر موضوع، از نقاط گلوله‌ای برای لیست کردن نکات کلیدی استفاده کنید\n"
+                    "4. اطلاعات مهم، نام‌ها و اعداد را با فرمت *پررنگ* یا _مورب_ برای تأکید قالب‌بندی کنید\n\n"
+                    "به شناسه پیام‌ها اشاره نکنید و مرجع‌دهی نداشته باشید. فقط بر خلاصه‌سازی محتوا در قالبی خوانا و ساختارمند تمرکز کنید.",
             "summary_request": "خلاصه موجز:",
             "processing_message": f"⏳ در حال دریافت و خلاصه‌سازی {actual_count} پیام اخیر با استفاده از هوش مصنوعی... لطفاً صبر کنید.",
             "error_message": "❌ اوپس! هنگام تولید خلاصه مشکلی پیش آمد. لطفاً بعداً دوباره امتحان کنید. اگر مشکل ادامه داشت، با مدیر ربات تماس بگیرید.",
             "summary_header": f"**✨ خلاصه پیام‌های اخیر ✨**\n\n",
-            "summary_footer": "\n\n*توجه: لینک‌های پیام در ابرگروه‌ها و گروه‌های عمومی کار می‌کنند. در گروه‌های خصوصی، ممکن است لینک‌ها برای همه کاربران کار نکنند.*"
+            "summary_footer": ""
         }
     }
     
@@ -432,10 +487,14 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     try:
         generation_config = GenerationConfig() # Add specific config if needed
 
-        response = await asyncio.to_thread(
-            gemini_model.generate_content,
-            prompt,
-            generation_config=generation_config,
+        # Add timeout to prevent hanging on slow responses
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                gemini_model.generate_content,
+                prompt,
+                generation_config=generation_config,
+            ),
+            timeout=API_TIMEOUT_SECONDS
         )
 
         # --- Refined Response Handling (for v0.8.5+) ---
@@ -529,6 +588,11 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             user_last_summary_request[user_id] = time.monotonic()
 
     # --- Exception Handling ---
+    except asyncio.TimeoutError:
+        logger.error(f"Timeout ({API_TIMEOUT_SECONDS}s) exceeded waiting for Gemini API response for chat {chat_id}, user {user_id}")
+        user_error_message = f"❌ The request to the summarization service timed out after {API_TIMEOUT_SECONDS} seconds. Please try again later."
+        error_occurred = True
+        
     except (BlockedPromptException, StopCandidateException) as safety_exception:
         logger.error(f"{type(safety_exception).__name__} during summary for chat {chat_id}, user {user_id}: {safety_exception}", exc_info=False)
         error_occurred = True
@@ -574,7 +638,6 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     # 7. Send Result or Error Message
     if not error_occurred and summary_text:
         try:
-            summary_text = add_message_links(summary_text, chat_id)
             reply_text = (
                 f"{templates['summary_header']}"
                 f"{summary_text}\n\n"
@@ -596,6 +659,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """Stores incoming text messages from groups/supergroups in the cache."""
     if not update.message or not update.message.text or update.message.via_bot:
         return
+
+    # Periodically clean up old cache entries
+    cleanup_old_cache_entries()
 
     chat = update.message.chat
     if chat.type not in (constants.ChatType.GROUP, constants.ChatType.SUPERGROUP):
@@ -690,35 +756,71 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 def main() -> None:
     """Sets up the Telegram Application and starts the bot polling."""
+    # Display bot startup banner
+    startup_banner = f"""
+    ┌───────────────────────────────────────────────┐
+    │ 🤖 Telegram Group Chat Summarizer Bot 🤖       │
+    │ Using Google Gemini AI for summarization      │
+    │ Version: 1.1.0                                │
+    └───────────────────────────────────────────────┘
+    """
+    print(startup_banner)
+    
     logger.info(f"--- Initializing Telegram Bot (PID: {os.getpid()}) ---")
-    logger.info(f"Using Telegram Bot Token: {'*' * (len(TELEGRAM_TOKEN or '') - 4)}{(TELEGRAM_TOKEN or '')[-4:]}")
+    
+    # Log system and environment information
+    import platform
+    import sys
+    
+    logger.info(f"Python version: {sys.version}")
+    logger.info(f"Platform: {platform.platform()}")
+    logger.info(f"Using Telegram Bot Token: {'*' * (len(TELEGRAM_TOKEN or '') - 4)}{(TELEGRAM_TOKEN or '')[-4:] if TELEGRAM_TOKEN else 'None'}")
     logger.info(f"Using Gemini model: {GEMINI_MODEL_NAME}")
     logger.info(f"Message cache size per chat: {MESSAGE_CACHE_SIZE}")
     logger.info(f"Default summary length: {DEFAULT_SUMMARY_MESSAGES}, Max: {MAX_SUMMARY_MESSAGES}")
     logger.info(f"Summary command cooldown: {SUMMARY_COOLDOWN_SECONDS} seconds per user")
+    logger.info(f"API timeout: {API_TIMEOUT_SECONDS} seconds")
+    logger.info(f"Cache cleanup interval: {CACHE_CLEANUP_INTERVAL} seconds")
     if ADMIN_CHAT_ID:
         logger.info(f"Admin chat ID for notifications: {ADMIN_CHAT_ID}")
     else:
         logger.warning("ADMIN_CHAT_ID not set. Error notifications will not be sent via Telegram.")
 
-    builder = ApplicationBuilder().token(TELEGRAM_TOKEN)
-    application = builder.build()
+    try:
+        builder = ApplicationBuilder().token(TELEGRAM_TOKEN)
+        application = builder.build()
 
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", start_command))
-    application.add_handler(CommandHandler(COMMAND_NAME, summarize_command))
+        application.add_handler(CommandHandler("start", start_command))
+        application.add_handler(CommandHandler("help", start_command))
+        application.add_handler(CommandHandler(COMMAND_NAME, summarize_command))
 
-    application.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS & ~filters.VIA_BOT,
-        handle_message
-    ))
+        application.add_handler(MessageHandler(
+            filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS & ~filters.VIA_BOT,
+            handle_message
+        ))
 
-    application.add_error_handler(error_handler)
+        application.add_error_handler(error_handler)
 
-    logger.info("Bot polling started...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+        logger.info("Bot polling started...")
+        print("✅ Bot is now online and listening for messages!")
+        application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
-    logger.info("--- Bot polling stopped ---")
+    except Exception as e:
+        logger.critical(f"Critical error during bot initialization or polling: {e}", exc_info=True)
+        print(f"❌ Error starting bot: {e}")
+        if ADMIN_CHAT_ID:
+            # Try to notify admin even if we can't start polling
+            try:
+                import httpx
+                message = f"🚨 CRITICAL: Bot failed to start!\nError: {type(e).__name__} - {e}"
+                url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+                httpx.post(url, json={"chat_id": ADMIN_CHAT_ID, "text": message})
+            except Exception as notify_err:
+                logger.error(f"Failed to notify admin about startup failure: {notify_err}")
+    finally:
+        # Perform cleanup
+        logger.info("--- Bot polling stopped, cleaning up resources ---")
+        print("👋 Bot is shutting down...")
 
 if __name__ == "__main__":
     main()
