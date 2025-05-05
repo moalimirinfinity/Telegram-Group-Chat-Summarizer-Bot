@@ -10,9 +10,10 @@ from datetime import datetime, timezone, timedelta
 
 # Third-party libraries
 import google.generativeai as genai
+# Import necessary types - Removed Candidate import based on ImportError
 from google.generativeai.types import (
     GenerationConfig, SafetySettingDict, HarmCategory, HarmBlockThreshold,
-    BlockedPromptException, StopCandidateException, Candidate # Added Candidate here
+    BlockedPromptException, StopCandidateException
 )
 # Import specific API core exceptions if needed for network/auth issues
 # from google.api_core.exceptions import GoogleAPIError, ClientError
@@ -335,33 +336,45 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         # Access text safely, checking candidate finish reason
         candidate = response.candidates[0]
 
-        # --- *** FIX APPLIED HERE *** ---
-        # Check finish reason using Candidate.FinishReason enum members
-        if candidate.finish_reason == Candidate.FinishReason.SAFETY:
+        # --- *** FIX APPLIED HERE (Revision 2) *** ---
+        # Check finish reason using genai.types.FinishReason enum members
+        # Ensure genai is imported
+        if candidate.finish_reason == genai.types.FinishReason.SAFETY:
             safety_ratings_str = ", ".join([f"{rating.category.name}: {rating.probability.name}" for rating in candidate.safety_ratings])
             logger.warning(f"Summary generation stopped due to SAFETY concerns for chat {chat_id} requested by {user_id}. Ratings: {safety_ratings_str}. Citations: {candidate.citation_metadata}")
             user_error_message = "❌ Summary generation stopped due to safety concerns. The generated content might contain sensitive topics based on safety ratings."
-            # Use StopCandidateException just for raising the exception, not accessing the enum
             raise StopCandidateException(f"Safety stop: {safety_ratings_str}")
 
-        elif candidate.finish_reason == Candidate.FinishReason.RECITATION:
+        elif candidate.finish_reason == genai.types.FinishReason.RECITATION:
              logger.warning(f"Summary generation stopped due to RECITATION concerns for chat {chat_id} requested by {user_id}. Citations: {candidate.citation_metadata}")
              user_error_message = "❌ Summary generation stopped. The content may include material from protected sources."
              raise StopCandidateException("Recitation stop")
 
-        elif candidate.finish_reason not in [Candidate.FinishReason.STOP, Candidate.FinishReason.MAX_TOKENS]:
+        elif candidate.finish_reason not in [genai.types.FinishReason.STOP, genai.types.FinishReason.MAX_TOKENS]:
              # Handle other non-standard finish reasons (e.g., OTHER, UNKNOWN)
-             logger.warning(f"Summary generation finished unexpectedly for chat {chat_id} requested by {user_id}. Reason: {candidate.finish_reason.name}")
-             user_error_message = f"❌ Summary generation finished unexpectedly ({candidate.finish_reason.name}). Please try again."
-             raise StopCandidateException(f"Unexpected finish: {candidate.finish_reason.name}")
+             # Accessing .name might fail if finish_reason is None or not an enum, add checks if needed
+             finish_reason_name = getattr(candidate.finish_reason, 'name', 'UNKNOWN')
+             logger.warning(f"Summary generation finished unexpectedly for chat {chat_id} requested by {user_id}. Reason: {finish_reason_name}")
+             user_error_message = f"❌ Summary generation finished unexpectedly ({finish_reason_name}). Please try again."
+             raise StopCandidateException(f"Unexpected finish: {finish_reason_name}")
         # --- *** END OF FIX *** ---
 
 
         # Get the text content if valid
-        if not candidate.content or not candidate.content.parts or not candidate.content.parts[0].text:
-            logger.warning(f"Gemini API returned empty text content for chat {chat_id} requested by {user_id}. Finish Reason: {candidate.finish_reason.name}. Response: {response}")
-            user_error_message = "❌ Summary generation resulted in empty content. This might be due to filtering or an API issue. Please try again later."
-            raise ValueError("Received empty text part from API.")
+        # Add checks for content and parts existing before accessing text
+        if not candidate.content or not candidate.content.parts:
+             # Determine finish reason name safely
+             finish_reason_name = getattr(candidate.finish_reason, 'name', 'UNKNOWN')
+             logger.warning(f"Gemini API returned no content or parts for chat {chat_id} requested by {user_id}. Finish Reason: {finish_reason_name}. Response: {response}")
+             user_error_message = "❌ Summary generation resulted in no content. This might be due to filtering or an API issue. Please try again later."
+             raise ValueError("Received no content/parts from API.")
+        if not candidate.content.parts[0].text:
+             # Finish reason name check might be redundant if content/parts existed but text was empty
+             finish_reason_name = getattr(candidate.finish_reason, 'name', 'UNKNOWN')
+             logger.warning(f"Gemini API returned empty text content part for chat {chat_id} requested by {user_id}. Finish Reason: {finish_reason_name}. Response: {response}")
+             user_error_message = "❌ Summary generation resulted in empty content. This might be due to filtering or an API issue. Please try again later."
+             raise ValueError("Received empty text part from API.")
+
 
         summary_text = candidate.content.parts[0].text.strip()
 
@@ -406,6 +419,11 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
              user_error_message = "❌ Rate limit exceeded for the summarization service. Please wait and try again."
         else:
              user_error_message = "❌ A Google API error occurred while generating the summary. Please notify the bot admin."
+        error_occurred = True
+
+    except ValueError as val_err: # Catch the specific ValueError raised above for empty content
+        logger.error(f"ValueError during summary processing for chat {chat_id}, user {user_id}: {val_err}", exc_info=False)
+        # user_error_message is already set when the error was raised
         error_occurred = True
 
     except Exception as e:
