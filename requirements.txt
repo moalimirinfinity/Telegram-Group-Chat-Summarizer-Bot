@@ -5,7 +5,7 @@
 python-telegram-bot[ext]==21.2
 
 # Google Generative AI library
-google-generativeai==0.7.1
+google-generativeai==0.8.5
 
 # For loading environment variables from .env file
 python-dotenv==1.0.1
