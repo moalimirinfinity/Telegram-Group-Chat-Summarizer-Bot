@@ -268,8 +268,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             f"Example: `/{COMMAND_NAME} 50`\n\n"
             f"I use the `{GEMINI_MODEL_NAME}` model for generating summaries.\n"
             f"There's a {SUMMARY_COOLDOWN_SECONDS}-second cooldown per user for this command to prevent spam.\n\n"
-            "**Important:** For me to see messages and summarize them, 'Group Privacy' mode must be **disabled** in my settings. "
-            "You can manage this via @BotFather (`/mybots` -> select bot -> `Bot Settings` -> `Group Privacy` -> `Turn off`)."
+            "**Important:** This bot is not fully deployed by choice and will only function when actively hosted. For more information, please contact @moalimir "
+             
         ),
         "fa": (
             "سلام! من یک ربات هستم که برای خلاصه‌سازی پیام‌های اخیر در این گروه طراحی شده‌ام.\n\n"
@@ -278,8 +278,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             f"مثال: `/{COMMAND_NAME} 50`\n\n"
             f"من از مدل `{GEMINI_MODEL_NAME}` برای تولید خلاصه‌ها استفاده می‌کنم.\n"
             f"یک زمان انتظار {SUMMARY_COOLDOWN_SECONDS} ثانیه‌ای برای هر کاربر برای این دستور وجود دارد تا از اسپم جلوگیری شود.\n\n"
-            "**مهم:** برای اینکه من بتوانم پیام‌ها را ببینم و خلاصه کنم، حالت 'حریم خصوصی گروه' باید در تنظیمات من **غیرفعال** باشد. "
-            "شما می‌توانید این را از طریق @BotFather مدیریت کنید (`/mybots` -> انتخاب ربات -> `Bot Settings` -> `Group Privacy` -> `Turn off`)."
+            "**مهم:** این ربات به صورت کامل مستقر نشده و فقط زمانی که میزبانی فعال باشد کار می‌کند. برای اطلاعات بیشتر، لطفاً با @moalimir تماس بگیرید."
         )
     }
     
@@ -373,7 +372,7 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         logger.info(f"No message cache found for chat {chat_id} when user {user_id} requested summarization.")
         await message.reply_text(
             "I haven't stored any messages from this chat yet, or my cache was cleared. "
-            "Please wait for more messages to arrive or ensure I have permission to read messages (Group Privacy off)."
+            "Please wait for more messages to arrive or ensure the bot is currently being hosted."
         )
         return
 
@@ -759,7 +758,7 @@ def main() -> None:
     # Display bot startup banner
     startup_banner = f"""
     ┌───────────────────────────────────────────────┐
-    │ 🤖 Telegram Group Chat Summarizer Bot 🤖       │
+    │ 🤖 Telegram Group Chat Summarizer Bot 🤖     │
     │ Using Google Gemini AI for summarization      │
     │ Version: 1.1.0                                │
     └───────────────────────────────────────────────┘
