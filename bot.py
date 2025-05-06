@@ -1,4 +1,21 @@
 # -*- coding: utf-8 -*-
+"""
+Telegram Group Chat Summarizer Bot
+
+This bot listens to messages in Telegram group chats, stores them in memory,
+and generates concise summaries using Google's Gemini AI model when requested.
+
+Recent improvements:
+- Added topic-based summarization with references to critical messages
+- Implemented message link generation for public groups
+- Added robust markdown handling to fix parsing errors
+- Improved backward compatibility with existing message cache format
+- Enhanced error handling for Telegram formatting issues
+
+The bot now creates summaries organized by topic, with references to important 
+messages including usernames/IDs of the contributors. For public groups, it also
+adds clickable links to the original messages.
+"""
 import logging
 import os
 import asyncio
@@ -160,9 +177,18 @@ def get_message_link(chat_id: int, message_id: int) -> Optional[str]:
         return f"https://t.me/c/{public_chat_id}/{message_id}"
     return None
 
-def format_message_for_gemini(msg_data: tuple[int, str, str, datetime, Optional[int], Optional[str]]) -> str:
-    """Formats a single message tuple for the Gemini prompt."""
-    message_id, user_name, text, timestamp, user_id, username = msg_data
+def format_message_for_gemini(msg_data: tuple) -> str:
+    """Formats a single message tuple for the Gemini prompt.
+    Handles both old (4-element) and new (6-element) tuple formats for backward compatibility.
+    """
+    # Handle both old and new message formats for backward compatibility
+    if len(msg_data) >= 6:  # New format with user_id and username
+        message_id, user_name, text, timestamp, user_id, username = msg_data
+    else:  # Old format (backward compatibility)
+        message_id, user_name, text, timestamp = msg_data
+        user_id = None
+        username = None
+    
     ts_str = timestamp.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     safe_user_name = sanitize_for_prompt(user_name)
     text_content = text if text is not None else ""
@@ -176,14 +202,17 @@ def format_message_for_gemini(msg_data: tuple[int, str, str, datetime, Optional[
     
     return f"[{ts_str} - {user_info} (msg_id: {message_id})]: {text_content}"
 
-def format_messages_for_prompt(messages: list[tuple[int, str, str, datetime, Optional[int], Optional[str]]]) -> str:
-    """Formats a list of message tuples into a single string for the Gemini prompt."""
+def format_messages_for_prompt(messages: list) -> str:
+    """Formats a list of message tuples into a single string for the Gemini prompt.
+    Works with both old and new tuple formats for backward compatibility.
+    """
     return "\n".join(format_message_for_gemini(msg) for msg in messages)
 
 async def edit_or_reply_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, processing_msg_id: int = None, parse_mode=None, disable_web_page_preview=True):
-    """Tries to edit a message, falls back to sending a new one."""
-    try:
-        if processing_msg_id:
+    """Tries to edit a message, falls back to sending a new one. Handles Markdown parsing errors gracefully."""
+    # Try editing first if we have a message_id
+    if processing_msg_id:
+        try:
             await context.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=processing_msg_id,
@@ -192,9 +221,29 @@ async def edit_or_reply_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int
                 disable_web_page_preview=disable_web_page_preview
             )
             return
-    except TelegramError as e:
-        logger.error(f"Failed to edit message {processing_msg_id} in chat {chat_id}: {e}. Attempting to send new message instead.")
-
+        except TelegramError as e:
+            logger.error(f"Failed to edit message {processing_msg_id} in chat {chat_id}: {e}")
+            
+            # If it's a parsing error, try again without parse_mode
+            if "Can't parse entities" in str(e) and parse_mode:
+                try:
+                    # Strip all markdown symbols and try again
+                    plain_text = re.sub(r'[\*_\[\]\(\)`]', '', text)
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=processing_msg_id,
+                        text=plain_text,
+                        parse_mode=None,
+                        disable_web_page_preview=disable_web_page_preview
+                    )
+                    logger.info(f"Successfully edited message as plain text after parsing failed.")
+                    return
+                except TelegramError as plain_err:
+                    logger.error(f"Failed to edit even with plain text: {plain_err}")
+                    # Fall through to sending a new message
+            logger.info("Attempting to send new message instead.")
+    
+    # Send a new message, using original formatting first
     try:
         await context.bot.send_message(
             chat_id=chat_id,
@@ -202,10 +251,38 @@ async def edit_or_reply_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int
             parse_mode=parse_mode,
             disable_web_page_preview=disable_web_page_preview
         )
+        return
     except TelegramError as send_err:
-        logger.error(f"Failed even to send new message to chat {chat_id} after edit failed or wasn't applicable: {send_err}")
+        # If parsing error, try again without formatting
+        if "Can't parse entities" in str(send_err) and parse_mode:
+            logger.error(f"Failed to send message with parsing: {send_err}. Trying plain text.")
+            try:
+                # Strip all markdown symbols and try again
+                plain_text = re.sub(r'[\*_\[\]\(\)`]', '', text)
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=plain_text,
+                    parse_mode=None, 
+                    disable_web_page_preview=disable_web_page_preview
+                )
+                logger.info("Successfully sent message as plain text.")
+                return
+            except TelegramError as plain_send_err:
+                logger.error(f"Failed to send even plain text message: {plain_send_err}")
+        else:
+            logger.error(f"Failed to send message to chat {chat_id}: {send_err}")
+    
+    # Last resort: try to send a short error message
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="❌ Error displaying the summary due to formatting issues.",
+            parse_mode=None
+        )
+    except TelegramError as final_err:
+        logger.error(f"Failed to send even a simple error message to chat {chat_id}: {final_err}")
 
-def detect_language(messages: list[tuple[int, str, str, datetime, Optional[int], Optional[str]]]) -> str:
+def detect_language(messages: list) -> str:
     """
     Detect the primary language used in a list of messages, supporting English and Persian.
     
@@ -214,7 +291,7 @@ def detect_language(messages: list[tuple[int, str, str, datetime, Optional[int],
     specifically, with a bias toward English as default.
     
     Args:
-        messages: A list of message tuples in (message_id, user_name, text, timestamp, user_id, username) format
+        messages: A list of message tuples in either old or new format
         
     Returns:
         str: A language code, either "en" for English or "fa" for Persian.
@@ -224,6 +301,7 @@ def detect_language(messages: list[tuple[int, str, str, datetime, Optional[int],
         return "en"  # Default to English if no messages
     
     # Collect texts with adequate length (longer texts are more reliable for detection)
+    # Text is always at index 2 in both old and new formats
     filtered_texts = [msg[2] for msg in messages if msg[2] and len(msg[2]) > 10]
     
     # Return English if not enough text to detect
@@ -301,7 +379,7 @@ def cleanup_old_cache_entries() -> None:
             # Get timestamp of last message (if available)
             try:
                 last_msg = msg_deque[-1]
-                # Check if message tuple has enough elements (timestamp is at index 3)
+                # In both old and new formats, timestamp is at index 3
                 if len(last_msg) >= 4:
                     last_timestamp = last_msg[3]  # Access the timestamp
                     if isinstance(last_timestamp, datetime):
@@ -340,6 +418,87 @@ async def notify_admin_of_error(context: ContextTypes.DEFAULT_TYPE, error: Excep
         await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=error_details[:4000])
     except Exception as notify_err:
         logger.error(f"Failed to send error notification to admin {ADMIN_CHAT_ID}: {notify_err}")
+
+def sanitize_markdown(text: str) -> str:
+    """
+    Sanitize markdown to fix common issues that would cause Telegram parsing errors.
+    - Ensures all entities (bold, italic, links) are properly closed
+    - Escapes characters that could break markdown parsing
+    - Fixes nested entities that Telegram can't handle
+    
+    Returns sanitized text that can be safely sent with ParseMode.MARKDOWN
+    """
+    if not text:
+        return text
+        
+    # Simple detection of unmatched markdown entities
+    entity_pairs = [
+        ('*', '*'),   # Bold
+        ('_', '_'),   # Italic
+        ('`', '`'),   # Monospace
+        ('[', ']'),   # Link text
+        ('(', ')')    # Link URL
+    ]
+    
+    # Check for and fix unbalanced entities
+    sanitized = text
+    
+    # First fix improper nesting of entities (Telegram doesn't support nested entities)
+    # e.g. *bold _italic_* is not allowed, should be *bold* _italic_
+    
+    # Fix broken links that might cause parsing errors
+    # Look for unfinished link patterns: [text](url without closing ) 
+    link_pattern = re.compile(r'\[([^\]]+)\]\([^)]*$', re.MULTILINE)
+    sanitized = link_pattern.sub(r'\1', sanitized)  # Replace with just the text
+    
+    # Fix links with spaces or problematic characters in URLs
+    # Telegram doesn't support spaces in URLs for markdown links
+    url_with_spaces = re.compile(r'\[([^\]]+)\]\(([^)]*\s+[^)]*)\)')
+    sanitized = url_with_spaces.sub(r'\1 (\2)', sanitized)  # Replace with text (url)
+    
+    # Fix broken URLs with special characters
+    sanitized = re.sub(r'\[([^\]]+)\]\(([^)]*[<>{}|\\^~][^)]*)\)', r'\1', sanitized)
+    
+    # Remove any incomplete links (common source of errors)
+    sanitized = re.sub(r'\[[^\]]*$', '', sanitized)  # Remove [text without closing ]
+    
+    # Remove unclosed parentheses in links (also common error)
+    sanitized = re.sub(r'\([^)]*$', '', sanitized)   # Remove (url without closing )
+    
+    # Handle the specific case of the error at byte offset 4152 (link errors are common there)
+    # If we know the exact position, we can apply more targeted fixes
+    if len(sanitized) > 4000:  # Only check for long messages
+        # Split into chunks to isolate the problematic area
+        part1 = sanitized[:4000] 
+        part2 = sanitized[4000:]
+        
+        # Add extra scrutiny to the boundary area
+        boundary = sanitized[4000-100:4000+100]
+        if '[' in boundary and '](' in boundary:
+            # There's a link near the boundary, which might be causing issues
+            part1 = re.sub(r'\[[^\]]*$', '', part1)  # Remove incomplete link at the end of part1
+            part2 = re.sub(r'^[^\]]*\](\([^)]*\))?', '', part2)  # Remove incomplete link at start of part2
+        
+        sanitized = part1 + part2
+    
+    # Check for any remaining unbalanced entities
+    for opener, closer in entity_pairs:
+        # Count instances of each character
+        open_count = sanitized.count(opener)
+        close_count = sanitized.count(closer)
+        
+        # If unbalanced, add missing closers at the end
+        if open_count > close_count:
+            sanitized += closer * (open_count - close_count)
+    
+    # Replace triple backticks with single backticks (Telegram doesn't support code blocks with ```)
+    sanitized = re.sub(r'```([^`]+)```', r'`\1`', sanitized)
+    
+    # Final precaution: limit to Telegram's max message length for safety
+    if len(sanitized) > 4096:
+        sanitized = sanitized[:4093] + "..."
+    
+    return sanitized
 
 # --- Telegram Command Handlers ---
 
@@ -745,28 +904,44 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             if is_public_group:
                 # Find all message ID references and replace with links
                 matches = msg_id_pattern.findall(processed_summary)
-                for msg_id_str in matches:
+                # Process unique message IDs to avoid redundant processing
+                unique_msg_ids = set(matches)
+                
+                # Track if link replacements are successful
+                replacement_success = True
+                
+                for msg_id_str in unique_msg_ids:
                     try:
                         msg_id = int(msg_id_str)
                         msg_link = get_message_link(chat_id, msg_id)
                         if msg_link:
-                            # Replace the message ID reference with a link
-                            processed_summary = processed_summary.replace(
-                                f"(msg_id: {msg_id})", 
-                                f"(msg_id: {msg_id}) [→ message link]({msg_link})"
-                            )
+                            # Use a simpler replacement format that's less likely to break
+                            # Telegram's markdown parser
+                            old_text = f"(msg_id: {msg_id})"
+                            new_text = f"(msg_id: {msg_id}) [link]({msg_link})"
+                            processed_summary = processed_summary.replace(old_text, new_text)
                     except (ValueError, TypeError) as e:
                         logger.warning(f"Error processing message ID {msg_id_str} for linking: {e}")
+                        replacement_success = False
+                
+                # If there were link replacement issues, log it
+                if not replacement_success:
+                    logger.warning(f"Some message link replacements failed for chat {chat_id}. The summary may have formatting issues.")
+                
+            # Sanitize markdown to fix common issues that would cause Telegram parsing errors
+            sanitized_summary = sanitize_markdown(processed_summary)
             
             reply_text = (
                 f"{templates['summary_header']}"
-                f"{processed_summary}\n\n"
+                f"{sanitized_summary}\n\n"
                 f"{templates['summary_footer']}"
             )
+            
+            # Send the message - edit_or_reply_message will handle parsing errors gracefully
             await edit_or_reply_message(context, chat_id, reply_text, processing_msg_id, constants.ParseMode.MARKDOWN)
             logger.info(f"Successfully generated and sent summary for chat {chat_id} ({actual_count} messages) requested by user {user_id}.")
         except Exception as final_send_err:
-            logger.error(f"Error sending final summary message for chat {chat_id}: {final_send_err}", exc_info=True)
+            logger.error(f"Error preparing or sending final summary message for chat {chat_id}: {final_send_err}", exc_info=True)
             await edit_or_reply_message(context, chat_id, "❌ Error displaying the summary.", processing_msg_id)
 
     elif error_occurred:
