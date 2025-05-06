@@ -712,14 +712,14 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     "Structure your summary as follows:\n"
                     "1. Start with a very brief overall summary in 1-2 sentences\n"
                     "2. Organize content into clearly labeled *important topics* using bold headings with emoji prefixes\n"
-                    "3. For each topic, identify and reference critical messages using the format: '@username (or username if @ not available) said: [message content]'\n"
-                    "4. When referencing a message, include its message_id in parentheses like (msg_id: 12345) so I can create links to those messages\n"
-                    "5. Specifically mention people by their Telegram usernames (e.g., @username) or IDs when they've made important contributions\n"
+                    "3. For each topic, identify and reference critical messages by mentioning the speaker and briefly summarizing what they said\n"
+                    "4. When referencing a message, include the message ID in a simple format at the end of the sentence, such as: 'John discussed project timeline (msg_id: 12345)'\n"
+                    "5. Specifically mention people by their Telegram usernames (e.g., @username) when they've made important contributions\n"
                     "6. Format important information, names, and numbers in *bold* or _italic_ for emphasis\n\n"
                     "IMPORTANT FORMAT INSTRUCTIONS:\n"
                     "- For bold text, use single asterisks like *this is bold* (not double asterisks)\n"
                     "- For italic text, use single underscores like _this is italic_\n"
-                    "- Always include the message ID format exactly as (msg_id: NUMBER) for each referenced message\n"
+                    "- When referencing important messages, include the message ID as (msg_id: NUMBER) so I can create a link to it\n"
                     "- Leave space between formatted text elements",
             "summary_request": "Topic-based summary with references to critical messages:",
             "processing_message": f"⏳ Fetching and summarizing the last {actual_count} cached messages using AI... please wait.",
@@ -734,14 +734,14 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     "خلاصه خود را به این شکل ساختاربندی کنید:\n"
                     "1. با یک خلاصه کلی و بسیار مختصر در 1-2 جمله شروع کنید\n"
                     "2. محتوا را به *موضوعات مهم* با عناوین پررنگ و ایموجی مناسب سازماندهی کنید\n"
-                    "3. برای هر موضوع، پیام‌های مهم را با قالب '@نام‌کاربری (یا نام کاربر اگر @ موجود نیست) گفت: [محتوای پیام]' ارجاع دهید\n"
-                    "4. هنگام ارجاع به یک پیام، شناسه پیام را در پرانتز مانند (msg_id: 12345) قرار دهید تا بتوانم به این پیام‌ها لینک ایجاد کنم\n"
-                    "5. به طور خاص افراد را با نام کاربری تلگرام آنها (مانند @نام‌کاربری) یا شناسه‌هایشان ذکر کنید وقتی نکات مهمی ارائه داده‌اند\n"
+                    "3. برای هر موضوع، پیام‌های مهم را با ذکر نام گوینده و خلاصه‌ای کوتاه از آنچه گفته‌اند ارجاع دهید\n"
+                    "4. هنگام ارجاع به یک پیام مهم، شناسه پیام را در انتهای جمله به فرمت ساده اضافه کنید، مثلاً: 'علی درباره زمان‌بندی پروژه صحبت کرد (msg_id: 12345)'\n"
+                    "5. افراد را با نام کاربری تلگرام آنها (مانند @نام‌کاربری) ذکر کنید وقتی نکات مهمی ارائه داده‌اند\n"
                     "6. اطلاعات مهم، نام‌ها و اعداد را با فرمت *پررنگ* یا _مورب_ برای تأکید قالب‌بندی کنید\n\n"
                     "دستورالعمل‌های مهم قالب‌بندی:\n"
                     "- برای متن پررنگ، از یک ستاره در هر طرف مانند *این متن پررنگ است* استفاده کنید (نه دو ستاره)\n"
                     "- برای متن مورب، از یک زیرخط در هر طرف مانند _این متن مورب است_ استفاده کنید\n"
-                    "- همیشه شناسه پیام را دقیقاً به صورت (msg_id: شماره) برای هر پیام ارجاع شده قرار دهید\n"
+                    "- هنگام ارجاع به پیام‌های مهم، شناسه پیام را به صورت (msg_id: شماره) قرار دهید تا بتوان به آن لینک ایجاد کرد\n"
                     "- بین عناصر متنی قالب‌بندی شده فاصله بگذارید",
             "summary_request": "خلاصه موضوعی با ارجاع به پیام‌های مهم:",
             "processing_message": f"⏳ در حال دریافت و خلاصه‌سازی {actual_count} پیام اخیر با استفاده از هوش مصنوعی... لطفاً صبر کنید.",
@@ -936,6 +936,9 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             # Use regex to find message IDs in different formats that might be in the summary
             msg_id_pattern = re.compile(r'\(msg_id: (\d+)\)')
             
+            # Also handle comma-separated lists of message IDs commonly found in summaries
+            comma_list_pattern = re.compile(r'msgid: (\d+)(?:, )?(\d+)?(?:, )?(\d+)?(?:, )?(\d+)?(?:, )?(\d+)?')
+            
             # Additional patterns that might appear incorrectly formatted
             additional_patterns = [
                 re.compile(r'msgid: (\d+)'),          # Without parentheses
@@ -953,6 +956,30 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             if is_public_group:
                 # Check if summary is in Persian language to handle RTL issues
                 is_persian = chat_lang == "fa"
+                
+                # First handle comma-separated lists of message IDs
+                for match in comma_list_pattern.finditer(processed_summary):
+                    original_text = match.group(0)
+                    replacement_text = original_text  # Start with original, then replace IDs with links
+                    
+                    # Process each ID in the list
+                    for i in range(1, 6):  # We have up to 5 capture groups for IDs
+                        if match.group(i):
+                            msg_id = int(match.group(i))
+                            msg_link = get_message_link(chat_id, msg_id)
+                            if msg_link:
+                                # Create link text based on language
+                                if is_persian:
+                                    link_text = f"\u200E[پیام]({msg_link})\u200F"
+                                else:
+                                    link_text = f"[message]({msg_link})"
+                                
+                                # Replace the ID with the link in the replacement text
+                                replacement_text = replacement_text.replace(str(msg_id), link_text)
+                    
+                    # Replace the entire matched text with our modified version
+                    if replacement_text != original_text:
+                        processed_summary = processed_summary.replace(original_text, replacement_text)
                 
                 # Process with the standard pattern first
                 matches = msg_id_pattern.findall(processed_summary)
@@ -981,29 +1008,17 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                             
                             # Create the replacement text based on language
                             if is_persian:
-                                # For Persian, add explicit RTL/LTR markers and use Persian word for link
-                                # \u200F is RTL mark, \u200E is LTR mark to control text direction
-                                # Add some non-breaking space for better formatting
-                                new_text = f"(msg_id: {msg_id}) \u200E[\u202Dپیوند\u202C]({msg_link})\u200F"
-                                
-                                # Additional fix for specific msgid: pattern with no space that's appearing in the output
-                                if "msgid:" + msg_id_str in processed_summary:
-                                    processed_summary = processed_summary.replace(
-                                        "msgid:" + msg_id_str, 
-                                        f"(msg_id: {msg_id}) \u200E[\u202Dپیوند\u202C]({msg_link})\u200F"
-                                    )
-                                # Catch cases where msgid and link are fused together
-                                if "msgid: " + msg_id_str + "link" in processed_summary:
-                                    processed_summary = processed_summary.replace(
-                                        "msgid: " + msg_id_str + "link", 
-                                        f"(msg_id: {msg_id}) \u200E[\u202Dپیوند\u202C]({msg_link})\u200F"
-                                    )
+                                # For Persian, create a subtle linked "message" text
+                                # that doesn't disrupt the flow of the text
+                                new_text = f"\u200E[پیام]({msg_link})\u200F"
                             else:
-                                # Format for LTR languages like English
-                                new_text = f"(msg_id: {msg_id}) [link]({msg_link})"
+                                # For English, create a subtle linked "message" text
+                                new_text = f"[message]({msg_link})"
                             
-                            # Replace standard format first
+                            # Replace standard format first - if found, use a more natural insertion
                             if standard_pattern in processed_summary:
+                                # Replace the message ID reference with a subtle link 
+                                # that doesn't disrupt the reading flow
                                 processed_summary = processed_summary.replace(standard_pattern, new_text)
                             else:
                                 # Try to replace other possible formats
@@ -1029,6 +1044,39 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 if not replacement_success:
                     logger.warning(f"Some message link replacements failed for chat {chat_id}. The summary may have formatting issues.")
                 
+            # Additional patterns specifically for Persian text
+            if is_persian:
+                # Also check for Persian patterns like "msgid: 123, 456, 789"
+                persian_patterns = [
+                    # Handle Persian numbers if they appear
+                    re.compile(r'msgid: (\d+)[،,] (\d+)[،,]? ?(\d+)?'),  # Persian comma (،) separated
+                    re.compile(r'پیام (\d+)'),  # "Message number"
+                    re.compile(r'شماره پیام (\d+)'),  # "Message number"
+                    re.compile(r'پیام شماره (\d+)'),  # "Message number"
+                ]
+                
+                # Process Persian-specific patterns
+                for pattern in persian_patterns:
+                    for match in pattern.finditer(processed_summary):
+                        try:
+                            # Get all capturing groups
+                            for i in range(1, pattern.groups + 1):
+                                if match.group(i):
+                                    msg_id = int(match.group(i))
+                                    msg_link = get_message_link(chat_id, msg_id)
+                                    if msg_link:
+                                        # For Persian, create a subtle linked text
+                                        link_text = f"\u200E[پیام]({msg_link})\u200F"
+                                        # Replace just this number with a link
+                                        number_to_replace = match.group(i)
+                                        processed_summary = processed_summary.replace(
+                                            number_to_replace, 
+                                            link_text,
+                                            1  # Replace only first occurrence to avoid unwanted replacements
+                                        )
+                        except (ValueError, TypeError) as e:
+                            logger.warning(f"Error processing Persian message pattern: {e}")
+            
             # Sanitize markdown to fix common issues that would cause Telegram parsing errors
             sanitized_summary = sanitize_markdown(processed_summary, is_rtl=is_persian)
             
