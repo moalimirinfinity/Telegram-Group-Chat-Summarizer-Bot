@@ -180,6 +180,7 @@ def get_message_link(chat_id: int, message_id: int) -> Optional[str]:
 def format_message_for_gemini(msg_data: tuple) -> str:
     """Formats a single message tuple for the Gemini prompt.
     Handles both old (4-element) and new (6-element) tuple formats for backward compatibility.
+    Provides rich context and makes username/user references prominent for linking.
     """
     # Handle both old and new message formats for backward compatibility
     if len(msg_data) >= 6:  # New format with user_id and username
@@ -193,14 +194,17 @@ def format_message_for_gemini(msg_data: tuple) -> str:
     safe_user_name = sanitize_for_prompt(user_name)
     text_content = text if text is not None else ""
     
-    # Include user identification information
+    # Format the user information with emphasis on username for better AI recognition
+    # This makes it easier for AI to consistently reference usernames in summaries
     user_info = f"{safe_user_name}"
     if username:
-        user_info += f" (@{username})"
-    if user_id:
+        # Make username prominent for better detection and linking
+        user_info = f"@{username} ({safe_user_name})"
+    elif user_id:
         user_info += f" [ID: {user_id}]"
     
-    return f"[{ts_str} - {user_info} (msg_id: {message_id})]: {text_content}"
+    # Include message_id as metadata but not something expected to be in the output
+    return f"[{ts_str} - {user_info} - Message #{message_id}]: {text_content}"
 
 def format_messages_for_prompt(messages: list) -> str:
     """Formats a list of message tuples into a single string for the Gemini prompt.
@@ -713,13 +717,14 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     "1. Start with a very brief overall summary in 1-2 sentences\n"
                     "2. Organize content into clearly labeled *important topics* using bold headings with emoji prefixes\n"
                     "3. For each topic, identify and reference critical messages by mentioning the speaker and briefly summarizing what they said\n"
-                    "4. When referencing a message, include the message ID in a simple format at the end of the sentence, such as: 'John discussed project timeline (msg_id: 12345)'\n"
-                    "5. Specifically mention people by their Telegram usernames (e.g., @username) when they've made important contributions\n"
+                    "4. DO NOT include message IDs in your summary. Instead, provide context about who said what\n"
+                    "5. Always mention people by their Telegram usernames (e.g., @username) when referencing their contributions - this is very important\n"
                     "6. Format important information, names, and numbers in *bold* or _italic_ for emphasis\n\n"
                     "IMPORTANT FORMAT INSTRUCTIONS:\n"
                     "- For bold text, use single asterisks like *this is bold* (not double asterisks)\n"
                     "- For italic text, use single underscores like _this is italic_\n"
-                    "- When referencing important messages, include the message ID as (msg_id: NUMBER) so I can create a link to it\n"
+                    "- DO NOT include message IDs like (msg_id: NUMBER) in your summary\n"
+                    "- Be sure to include the @ symbol when mentioning usernames so links can be added to their messages\n"
                     "- Leave space between formatted text elements",
             "summary_request": "Topic-based summary with references to critical messages:",
             "processing_message": f"⏳ Fetching and summarizing the last {actual_count} cached messages using AI... please wait.",
@@ -735,13 +740,14 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     "1. با یک خلاصه کلی و بسیار مختصر در 1-2 جمله شروع کنید\n"
                     "2. محتوا را به *موضوعات مهم* با عناوین پررنگ و ایموجی مناسب سازماندهی کنید\n"
                     "3. برای هر موضوع، پیام‌های مهم را با ذکر نام گوینده و خلاصه‌ای کوتاه از آنچه گفته‌اند ارجاع دهید\n"
-                    "4. هنگام ارجاع به یک پیام مهم، شناسه پیام را در انتهای جمله به فرمت ساده اضافه کنید، مثلاً: 'علی درباره زمان‌بندی پروژه صحبت کرد (msg_id: 12345)'\n"
-                    "5. افراد را با نام کاربری تلگرام آنها (مانند @نام‌کاربری) ذکر کنید وقتی نکات مهمی ارائه داده‌اند\n"
+                    "4. شناسه‌های پیام (msgid) را در خلاصه خود قرار ندهید. به جای آن، توضیح دهید چه کسی چه گفته\n"
+                    "5. همیشه افراد را با نام کاربری تلگرام آنها (مانند @نام‌کاربری) ذکر کنید هنگام ارجاع به نکات آنها - این بسیار مهم است\n"
                     "6. اطلاعات مهم، نام‌ها و اعداد را با فرمت *پررنگ* یا _مورب_ برای تأکید قالب‌بندی کنید\n\n"
                     "دستورالعمل‌های مهم قالب‌بندی:\n"
                     "- برای متن پررنگ، از یک ستاره در هر طرف مانند *این متن پررنگ است* استفاده کنید (نه دو ستاره)\n"
                     "- برای متن مورب، از یک زیرخط در هر طرف مانند _این متن مورب است_ استفاده کنید\n"
-                    "- هنگام ارجاع به پیام‌های مهم، شناسه پیام را به صورت (msg_id: شماره) قرار دهید تا بتوان به آن لینک ایجاد کرد\n"
+                    "- شناسه‌های پیام مانند (msg_id: شماره) را در خلاصه خود قرار ندهید\n"
+                    "- حتما از علامت @ هنگام ذکر نام‌های کاربری استفاده کنید تا لینک‌ها به پیام‌های آنها اضافه شوند\n"
                     "- بین عناصر متنی قالب‌بندی شده فاصله بگذارید",
             "summary_request": "خلاصه موضوعی با ارجاع به پیام‌های مهم:",
             "processing_message": f"⏳ در حال دریافت و خلاصه‌سازی {actual_count} پیام اخیر با استفاده از هوش مصنوعی... لطفاً صبر کنید.",
@@ -933,149 +939,109 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             # Process the summary to add message links for cited messages
             processed_summary = summary_text
             
-            # Use regex to find message IDs in different formats that might be in the summary
-            msg_id_pattern = re.compile(r'\(msg_id: (\d+)\)')
-            
-            # Also handle comma-separated lists of message IDs commonly found in summaries
-            comma_list_pattern = re.compile(r'msgid: (\d+)(?:, )?(\d+)?(?:, )?(\d+)?(?:, )?(\d+)?(?:, )?(\d+)?')
-            
-            # Additional patterns that might appear incorrectly formatted
-            additional_patterns = [
-                re.compile(r'msgid: (\d+)'),          # Without parentheses
-                re.compile(r'msg_id:(\d+)'),          # Without space
-                re.compile(r'\(msgid: (\d+)\)'),      # Without underscore
-                re.compile(r'msgid:(\d+)'),           # Without space or underscore
-                re.compile(r'msg id: (\d+)'),         # With space instead of underscore
-                re.compile(r'message id: (\d+)'),     # Full words
-                re.compile(r'ID: (\d+)'),             # Just ID
-            ]
-            
             # Only add links if this is a public supergroup (starts with -100)
             is_public_group = str(chat_id).startswith('-100')
+            is_persian = chat_lang == "fa"
             
             if is_public_group:
-                # Check if summary is in Persian language to handle RTL issues
-                is_persian = chat_lang == "fa"
+                # Extract usernames mentioned in the summary
+                username_pattern = re.compile(r'@(\w+)')
+                usernames_mentioned = set(username_pattern.findall(processed_summary))
                 
-                # First handle comma-separated lists of message IDs
-                for match in comma_list_pattern.finditer(processed_summary):
-                    original_text = match.group(0)
-                    replacement_text = original_text  # Start with original, then replace IDs with links
+                # Create a mapping of usernames to message IDs in the original messages
+                username_to_messages = {}
+                for msg in messages_to_summarize:
+                    # Get username if it exists (in new format)
+                    if len(msg) >= 6 and msg[5]:  # Username exists
+                        username = msg[5]
+                        msg_id = msg[0]
+                        if username not in username_to_messages:
+                            username_to_messages[username] = []
+                        username_to_messages[username].append((msg_id, msg[2]))  # (msg_id, text)
+                
+                # Track which usernames have been linked already
+                linked_usernames = set()
+                
+                # Process the summary by paragraphs to add contextual links
+                paragraphs = processed_summary.split('\n\n')
+                processed_paragraphs = []
+                
+                for paragraph in paragraphs:
+                    # Check if this paragraph is a section/topic header
+                    is_header = '*' in paragraph and len(paragraph.strip()) < 100
                     
-                    # Process each ID in the list
-                    for i in range(1, 6):  # We have up to 5 capture groups for IDs
-                        if match.group(i):
-                            msg_id = int(match.group(i))
+                    # For each username mentioned in this paragraph
+                    for username in usernames_mentioned:
+                        if username not in username_to_messages or username in linked_usernames:
+                            continue
+                            
+                        # Get this user's messages
+                        user_msgs = username_to_messages[username]
+                        if not user_msgs:
+                            continue
+                        
+                        # For topic headers, use the most recent message
+                        if is_header:
+                            msg_id = user_msgs[-1][0]  # Most recent message ID
+                        else:
+                            # For content paragraphs, try to find the most relevant message for this topic
+                            # Simple relevance: longest message or most recent if we can't determine
+                            most_relevant_msg = max(user_msgs, key=lambda x: len(x[1]) if x[1] else 0)
+                            msg_id = most_relevant_msg[0]
+                        
+                        # Create the message link
+                        msg_link = get_message_link(chat_id, msg_id)
+                        if not msg_link:
+                            continue
+                            
+                        # Create link text based on language
+                        if is_persian:
+                            # For Persian, add RTL markers and use "پیام" (message)
+                            # \u200F is RTL mark, \u200E is LTR mark to ensure proper display
+                            link_text = f" \u200F[\u202Bپیام\u202C]({msg_link})\u200E"
+                        else:
+                            link_text = f" [message]({msg_link})"
+                        
+                        # Create pattern to find the username but avoid already linked instances
+                        username_pattern = re.compile(f'@{username}(?!\\[)')
+                        
+                        # Only add a link if the username is in this paragraph and not already linked
+                        if username_pattern.search(paragraph):
+                            paragraph = username_pattern.sub(f'@{username}{link_text}', paragraph, count=1)
+                            linked_usernames.add(username)
+                            logger.debug(f"Added message link for @{username}")
+                    
+                    processed_paragraphs.append(paragraph)
+                
+                # Reassemble the summary
+                processed_summary = '\n\n'.join(processed_paragraphs)
+                
+                # Final sweep for any remaining message ID patterns that may have been included despite instructions
+                msg_id_patterns = [
+                    re.compile(r'\(msg_id: (\d+)\)'),
+                    re.compile(r'msgid: (\d+)'),
+                    re.compile(r'\(msgid: (\d+)\)'),
+                    re.compile(r'msg_id: (\d+)'),
+                    re.compile(r'ID: (\d+)')
+                ]
+                
+                # Replace any message IDs with actual links
+                for pattern in msg_id_patterns:
+                    for match in pattern.finditer(processed_summary):
+                        try:
+                            msg_id = int(match.group(1))
                             msg_link = get_message_link(chat_id, msg_id)
                             if msg_link:
                                 # Create link text based on language
                                 if is_persian:
-                                    link_text = f"\u200E[پیام]({msg_link})\u200F"
+                                    link_text = f"\u200F[\u202Bپیام\u202C]({msg_link})\u200E"
                                 else:
                                     link_text = f"[message]({msg_link})"
-                                
-                                # Replace the ID with the link in the replacement text
-                                replacement_text = replacement_text.replace(str(msg_id), link_text)
-                    
-                    # Replace the entire matched text with our modified version
-                    if replacement_text != original_text:
-                        processed_summary = processed_summary.replace(original_text, replacement_text)
-                
-                # Process with the standard pattern first
-                matches = msg_id_pattern.findall(processed_summary)
-                
-                # Then check additional patterns and add any new matches
-                for pattern in additional_patterns:
-                    additional_matches = pattern.findall(processed_summary)
-                    if additional_matches:
-                        matches.extend(additional_matches)
-                        # Log that we found non-standard formats
-                        logger.info(f"Found {len(additional_matches)} message IDs in non-standard format")
-                
-                # Process unique message IDs to avoid redundant processing
-                unique_msg_ids = set(matches)
-                
-                # Track if link replacements are successful
-                replacement_success = True
-                
-                for msg_id_str in unique_msg_ids:
-                    try:
-                        msg_id = int(msg_id_str)
-                        msg_link = get_message_link(chat_id, msg_id)
-                        if msg_link:
-                            # Different formats for Persian (RTL) and other languages (LTR)
-                            standard_pattern = f"(msg_id: {msg_id})"
-                            
-                            # Create the replacement text based on language
-                            if is_persian:
-                                # For Persian, create a subtle linked "message" text
-                                # that doesn't disrupt the flow of the text
-                                new_text = f"\u200E[پیام]({msg_link})\u200F"
-                            else:
-                                # For English, create a subtle linked "message" text
-                                new_text = f"[message]({msg_link})"
-                            
-                            # Replace standard format first - if found, use a more natural insertion
-                            if standard_pattern in processed_summary:
-                                # Replace the message ID reference with a subtle link 
-                                # that doesn't disrupt the reading flow
-                                processed_summary = processed_summary.replace(standard_pattern, new_text)
-                            else:
-                                # Try to replace other possible formats
-                                for pattern_str in [
-                                    f"msgid: {msg_id}",
-                                    f"msg_id:{msg_id}",
-                                    f"(msgid: {msg_id})",
-                                    f"msgid:{msg_id}",
-                                    f"msg id: {msg_id}",
-                                    f"message id: {msg_id}",
-                                    f"ID: {msg_id}"
-                                ]:
-                                    if pattern_str in processed_summary:
-                                        processed_summary = processed_summary.replace(pattern_str, new_text)
-                                        # Once replaced, no need to try other patterns for this ID
-                                        break
-                                
-                    except (ValueError, TypeError) as e:
-                        logger.warning(f"Error processing message ID {msg_id_str} for linking: {e}")
-                        replacement_success = False
-                
-                # If there were link replacement issues, log it
-                if not replacement_success:
-                    logger.warning(f"Some message link replacements failed for chat {chat_id}. The summary may have formatting issues.")
-                
-            # Additional patterns specifically for Persian text
-            if is_persian:
-                # Also check for Persian patterns like "msgid: 123, 456, 789"
-                persian_patterns = [
-                    # Handle Persian numbers if they appear
-                    re.compile(r'msgid: (\d+)[،,] (\d+)[،,]? ?(\d+)?'),  # Persian comma (،) separated
-                    re.compile(r'پیام (\d+)'),  # "Message number"
-                    re.compile(r'شماره پیام (\d+)'),  # "Message number"
-                    re.compile(r'پیام شماره (\d+)'),  # "Message number"
-                ]
-                
-                # Process Persian-specific patterns
-                for pattern in persian_patterns:
-                    for match in pattern.finditer(processed_summary):
-                        try:
-                            # Get all capturing groups
-                            for i in range(1, pattern.groups + 1):
-                                if match.group(i):
-                                    msg_id = int(match.group(i))
-                                    msg_link = get_message_link(chat_id, msg_id)
-                                    if msg_link:
-                                        # For Persian, create a subtle linked text
-                                        link_text = f"\u200E[پیام]({msg_link})\u200F"
-                                        # Replace just this number with a link
-                                        number_to_replace = match.group(i)
-                                        processed_summary = processed_summary.replace(
-                                            number_to_replace, 
-                                            link_text,
-                                            1  # Replace only first occurrence to avoid unwanted replacements
-                                        )
+                                    
+                                # Replace the entire pattern with the link
+                                processed_summary = processed_summary.replace(match.group(0), link_text)
                         except (ValueError, TypeError) as e:
-                            logger.warning(f"Error processing Persian message pattern: {e}")
+                            logger.warning(f"Error processing message ID pattern: {e}")
             
             # Sanitize markdown to fix common issues that would cause Telegram parsing errors
             sanitized_summary = sanitize_markdown(processed_summary, is_rtl=is_persian)
