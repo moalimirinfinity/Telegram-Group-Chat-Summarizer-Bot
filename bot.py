@@ -10,6 +10,8 @@ import google.api_core.exceptions
 from collections import defaultdict, deque
 from datetime import datetime, timezone, timedelta
 import psutil  # For memory monitoring
+from typing import Optional
+import re
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -135,11 +137,11 @@ MESSAGE_CACHE_SIZE = 500
 SUMMARY_COOLDOWN_SECONDS = 60
 
 # --- In-Memory Caches ---
-message_cache: dict[int, deque[tuple[int, str, str, datetime]]] = defaultdict(lambda: deque(maxlen=MESSAGE_CACHE_SIZE))
+message_cache: dict[int, deque[tuple[int, str, str, datetime, Optional[int], Optional[str]]]] = defaultdict(lambda: deque(maxlen=MESSAGE_CACHE_SIZE))
 user_last_summary_request: dict[int, float] = {}
 chat_language_cache: dict[int, str] = {}  # Store detected language by chat_id
 last_cache_cleanup: float = time.monotonic()  # Time tracker for periodic cache cleanup
-CACHE_CLEANUP_INTERVAL = 3600  # Clean up old entries once per hour (in seconds)
+CACHE_CLEANUP_INTERVAL = 3600
 
 # --- Helper Functions ---
 
@@ -147,15 +149,34 @@ def sanitize_for_prompt(text: str) -> str:
     """Basic sanitization for user names included in prompts."""
     return text.replace('[', '(').replace(']', ')')
 
-def format_message_for_gemini(msg_data: tuple[int, str, str, datetime]) -> str:
+def get_message_link(chat_id: int, message_id: int) -> Optional[str]:
+    """
+    Generates a link to a specific message if the chat is a public group.
+    For private groups, returns None as message links can't be generated.
+    """
+    if str(chat_id).startswith('-100'):  # Public supergroups have IDs that start with -100
+        # Extract the group ID without the -100 prefix
+        public_chat_id = str(chat_id)[4:]
+        return f"https://t.me/c/{public_chat_id}/{message_id}"
+    return None
+
+def format_message_for_gemini(msg_data: tuple[int, str, str, datetime, Optional[int], Optional[str]]) -> str:
     """Formats a single message tuple for the Gemini prompt."""
-    message_id, user_name, text, timestamp = msg_data
+    message_id, user_name, text, timestamp, user_id, username = msg_data
     ts_str = timestamp.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     safe_user_name = sanitize_for_prompt(user_name)
     text_content = text if text is not None else ""
-    return f"[{ts_str} - {safe_user_name} (ID: {message_id})]: {text_content}"
+    
+    # Include user identification information
+    user_info = f"{safe_user_name}"
+    if username:
+        user_info += f" (@{username})"
+    if user_id:
+        user_info += f" [ID: {user_id}]"
+    
+    return f"[{ts_str} - {user_info} (msg_id: {message_id})]: {text_content}"
 
-def format_messages_for_prompt(messages: list[tuple[int, str, str, datetime]]) -> str:
+def format_messages_for_prompt(messages: list[tuple[int, str, str, datetime, Optional[int], Optional[str]]]) -> str:
     """Formats a list of message tuples into a single string for the Gemini prompt."""
     return "\n".join(format_message_for_gemini(msg) for msg in messages)
 
@@ -184,7 +205,7 @@ async def edit_or_reply_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int
     except TelegramError as send_err:
         logger.error(f"Failed even to send new message to chat {chat_id} after edit failed or wasn't applicable: {send_err}")
 
-def detect_language(messages: list[tuple[int, str, str, datetime]]) -> str:
+def detect_language(messages: list[tuple[int, str, str, datetime, Optional[int], Optional[str]]]) -> str:
     """
     Detect the primary language used in a list of messages, supporting English and Persian.
     
@@ -193,7 +214,7 @@ def detect_language(messages: list[tuple[int, str, str, datetime]]) -> str:
     specifically, with a bias toward English as default.
     
     Args:
-        messages: A list of message tuples in (message_id, user_name, text, timestamp) format
+        messages: A list of message tuples in (message_id, user_name, text, timestamp, user_id, username) format
         
     Returns:
         str: A language code, either "en" for English or "fa" for Persian.
@@ -280,7 +301,8 @@ def cleanup_old_cache_entries() -> None:
             # Get timestamp of last message (if available)
             try:
                 last_msg = msg_deque[-1]
-                if len(last_msg) >= 4:  # Ensure tuple has timestamp field
+                # Check if message tuple has enough elements (timestamp is at index 3)
+                if len(last_msg) >= 4:
                     last_timestamp = last_msg[3]  # Access the timestamp
                     if isinstance(last_timestamp, datetime):
                         # Convert to epoch seconds for comparison
@@ -496,34 +518,38 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     prompt_templates = {
         "en": {
             "intro": "You are a helpful assistant tasked with summarizing Telegram group chat conversations.\n"
-                    "Provide a *concise, well-structured, and clearly formatted* summary of the following messages. "
+                    "Provide a *concise, topic-based, and clearly formatted* summary of the following messages. "
                     "Focus on key discussion points, decisions made, questions asked, and any action items mentioned.\n\n"
                     "Structure your summary as follows:\n"
                     "1. Start with a very brief overall summary in 1-2 sentences\n"
-                    "2. Organize content into clearly labeled topics or themes using bold headings with emoji prefixes\n"
-                    "3. Under each topic, use bullet points to list key points\n"
-                    "4. Format important information, names, and numbers in *bold* or _italic_ for emphasis\n\n"
-                    "DO NOT reference message IDs or include citations. Focus only on summarizing the content in a readable, well-structured format.",
-            "summary_request": "Concise Summary:",
+                    "2. Organize content into clearly labeled **important topics** using bold headings with emoji prefixes\n"
+                    "3. For each topic, identify and reference critical messages using the format: '@username (or username if @ not available) said: [message content]'\n"
+                    "4. When referencing a message, include its message_id in parentheses like (msg_id: 12345) so I can create links to those messages\n"
+                    "5. Specifically mention people by their Telegram usernames (e.g., @username) or IDs when they've made important contributions\n"
+                    "6. Format important information, names, and numbers in *bold* or _italic_ for emphasis\n\n"
+                    "IMPORTANT: For each key message you reference, always include the message ID so I can link to it later. This is essential for traceability.",
+            "summary_request": "Topic-based summary with references to critical messages:",
             "processing_message": f"⏳ Fetching and summarizing the last {actual_count} cached messages using AI... please wait.",
             "error_message": "❌ Oops! Something went wrong while generating the summary. Please try again later. If the problem persists, contact the bot admin.",
-            "summary_header": f"**✨ SUMMARY OF RECENT MESSAGES ✨**\n\n",
+            "summary_header": f"**✨ TOPIC-BASED SUMMARY OF RECENT MESSAGES ✨**\n\n",
             "summary_footer": ""
         },
         "fa": {
             "intro": "شما یک دستیار هوشمند هستید که وظیفه خلاصه‌سازی گفتگوهای گروهی تلگرام را دارید.\n"
-                    "یک خلاصه *موجز، ساختارمند و به خوبی قالب‌بندی شده* از پیام‌های زیر ارائه دهید. "
+                    "یک خلاصه *موضوعی، موجز و به خوبی قالب‌بندی شده* از پیام‌های زیر ارائه دهید. "
                     "بر نکات کلیدی بحث، تصمیمات گرفته شده، سؤالات مطرح شده، و هرگونه موارد عملی ذکر شده تمرکز کنید.\n\n"
                     "خلاصه خود را به این شکل ساختاربندی کنید:\n"
                     "1. با یک خلاصه کلی و بسیار مختصر در 1-2 جمله شروع کنید\n"
-                    "2. محتوا را به موضوعات یا تم‌های مشخص با عناوین پررنگ و ایموجی مناسب سازماندهی کنید\n"
-                    "3. زیر هر موضوع، از نقاط گلوله‌ای برای لیست کردن نکات کلیدی استفاده کنید\n"
-                    "4. اطلاعات مهم، نام‌ها و اعداد را با فرمت *پررنگ* یا _مورب_ برای تأکید قالب‌بندی کنید\n\n"
-                    "به شناسه پیام‌ها اشاره نکنید و مرجع‌دهی نداشته باشید. فقط بر خلاصه‌سازی محتوا در قالبی خوانا و ساختارمند تمرکز کنید.",
-            "summary_request": "خلاصه پیام ها:",
+                    "2. محتوا را به **موضوعات مهم** با عناوین پررنگ و ایموجی مناسب سازماندهی کنید\n"
+                    "3. برای هر موضوع، پیام‌های مهم را با قالب '@نام‌کاربری (یا نام کاربر اگر @ موجود نیست) گفت: [محتوای پیام]' ارجاع دهید\n"
+                    "4. هنگام ارجاع به یک پیام، شناسه پیام را در پرانتز مانند (msg_id: 12345) قرار دهید تا بتوانم به این پیام‌ها لینک ایجاد کنم\n"
+                    "5. به طور خاص افراد را با نام کاربری تلگرام آنها (مانند @نام‌کاربری) یا شناسه‌هایشان ذکر کنید وقتی نکات مهمی ارائه داده‌اند\n"
+                    "6. اطلاعات مهم، نام‌ها و اعداد را با فرمت *پررنگ* یا _مورب_ برای تأکید قالب‌بندی کنید\n\n"
+                    "مهم: برای هر پیام کلیدی که ارجاع می‌دهید، همیشه شناسه پیام را قرار دهید تا بتوانم بعداً به آن لینک دهم. این برای قابلیت ردیابی ضروری است.",
+            "summary_request": "خلاصه موضوعی با ارجاع به پیام‌های مهم:",
             "processing_message": f"⏳ در حال دریافت و خلاصه‌سازی {actual_count} پیام اخیر با استفاده از هوش مصنوعی... لطفاً صبر کنید.",
             "error_message": "❌ اوپس! هنگام تولید خلاصه مشکلی پیش آمد. لطفاً بعداً دوباره امتحان کنید. اگر مشکل ادامه داشت، با مدیر ربات تماس بگیرید.",
-            "summary_header": f"**✨ خلاصه پیام‌های اخیر ✨**\n\n",
+            "summary_header": f"**✨ خلاصه موضوعی پیام‌های اخیر ✨**\n\n",
             "summary_footer": ""
         }
     }
@@ -707,9 +733,34 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     # 7. Send Result or Error Message
     if not error_occurred and summary_text:
         try:
+            # Process the summary to add message links for cited messages
+            processed_summary = summary_text
+            
+            # Use regex to find message IDs in the summary and add links
+            msg_id_pattern = re.compile(r'\(msg_id: (\d+)\)')
+            
+            # Only add links if this is a public supergroup (starts with -100)
+            is_public_group = str(chat_id).startswith('-100')
+            
+            if is_public_group:
+                # Find all message ID references and replace with links
+                matches = msg_id_pattern.findall(processed_summary)
+                for msg_id_str in matches:
+                    try:
+                        msg_id = int(msg_id_str)
+                        msg_link = get_message_link(chat_id, msg_id)
+                        if msg_link:
+                            # Replace the message ID reference with a link
+                            processed_summary = processed_summary.replace(
+                                f"(msg_id: {msg_id})", 
+                                f"(msg_id: {msg_id}) [→ message link]({msg_link})"
+                            )
+                    except (ValueError, TypeError) as e:
+                        logger.warning(f"Error processing message ID {msg_id_str} for linking: {e}")
+            
             reply_text = (
                 f"{templates['summary_header']}"
-                f"{summary_text}\n\n"
+                f"{processed_summary}\n\n"
                 f"{templates['summary_footer']}"
             )
             await edit_or_reply_message(context, chat_id, reply_text, processing_msg_id, constants.ParseMode.MARKDOWN)
@@ -742,12 +793,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if not user:
         user_name = "Anonymous"
+        user_id = None
+        username = None
     else:
         user_name = user.first_name.strip() if user.first_name else ""
         if not user_name and user.username:
             user_name = user.username.strip()
         if not user_name:
             user_name = f"User_{user.id}"
+        
+        user_id = user.id
+        username = user.username
 
     message_id = message.message_id
     text = message.text
@@ -756,7 +812,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
          timestamp = timestamp.replace(tzinfo=timezone.utc)
 
     try:
-        message_data = (message_id, user_name, text, timestamp)
+        message_data = (message_id, user_name, text, timestamp, user_id, username)
         message_cache[chat_id].append(message_data)
         
         # Update language detection every 10 messages
