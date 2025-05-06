@@ -1285,7 +1285,7 @@ def main() -> None:
                 except Exception as httpx_err:
                     logger.error(f"Failed even with direct API call to notify admin: {httpx_err}")
     finally:
-        # Perform cleanup
+      
         logger.info("--- Bot polling stopped, cleaning up resources ---")
         print("👋 Bot is shutting down...")
 
