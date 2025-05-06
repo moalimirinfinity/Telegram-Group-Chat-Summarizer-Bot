@@ -419,18 +419,23 @@ async def notify_admin_of_error(context: ContextTypes.DEFAULT_TYPE, error: Excep
     except Exception as notify_err:
         logger.error(f"Failed to send error notification to admin {ADMIN_CHAT_ID}: {notify_err}")
 
-def sanitize_markdown(text: str) -> str:
+def sanitize_markdown(text: str, is_rtl: bool = False) -> str:
     """
     Sanitize markdown to fix common issues that would cause Telegram parsing errors.
     - Ensures all entities (bold, italic, links) are properly closed
     - Escapes characters that could break markdown parsing
     - Fixes nested entities that Telegram can't handle
+    - Handles RTL/LTR mixed content issues for languages like Persian
+    
+    Args:
+        text: The text to sanitize
+        is_rtl: Whether the text is in a right-to-left language like Persian or Arabic
     
     Returns sanitized text that can be safely sent with ParseMode.MARKDOWN
     """
     if not text:
         return text
-        
+    
     # Simple detection of unmatched markdown entities
     entity_pairs = [
         ('*', '*'),   # Bold
@@ -443,8 +448,24 @@ def sanitize_markdown(text: str) -> str:
     # Check for and fix unbalanced entities
     sanitized = text
     
-    # First fix improper nesting of entities (Telegram doesn't support nested entities)
+    # Fix improper nesting of entities (Telegram doesn't support nested entities)
     # e.g. *bold _italic_* is not allowed, should be *bold* _italic_
+    
+    # RTL-specific fixes for Persian or Arabic text
+    if is_rtl:
+        # Find all markdown links which might have RTL/LTR conflicts
+        link_pattern = re.compile(r'\[([^\]]+)\]\(([^)]+)\)')
+        
+        # Function to add directional markers around links
+        def fix_link_direction(match):
+            link_text = match.group(1)
+            link_url = match.group(2)
+            # Add LTR mark before URL (which is always LTR)
+            # Add RTL mark after to return to RTL context
+            return f"[{link_text}](\u200E{link_url}\u200F)"
+        
+        # Apply the fix to all links
+        sanitized = link_pattern.sub(fix_link_direction, sanitized)
     
     # Fix broken links that might cause parsing errors
     # Look for unfinished link patterns: [text](url without closing ) 
@@ -704,7 +725,7 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     "4. هنگام ارجاع به یک پیام، شناسه پیام را در پرانتز مانند (msg_id: 12345) قرار دهید تا بتوانم به این پیام‌ها لینک ایجاد کنم\n"
                     "5. به طور خاص افراد را با نام کاربری تلگرام آنها (مانند @نام‌کاربری) یا شناسه‌هایشان ذکر کنید وقتی نکات مهمی ارائه داده‌اند\n"
                     "6. اطلاعات مهم، نام‌ها و اعداد را با فرمت *پررنگ* یا _مورب_ برای تأکید قالب‌بندی کنید\n\n"
-                    "مهم: برای هر پیام کلیدی که ارجاع می‌دهید، همیشه شناسه پیام را قرار دهید تا بتوانم بعداً به آن لینک دهم. این برای قابلیت ردیابی ضروری است.",
+                    "مهم: برای هر پیام کلیدی که ارجاع می‌دهید، همیشه از کلمه \"msg_id: شماره\" مانند (msg_id: 12345) استفاده کنید. از ترکیب کلمات \"msgid\" یا هر فرمت دیگری استفاده نکنید. این برای قابلیت ردیابی و ایجاد لینک ضروری است.",
             "summary_request": "خلاصه موضوعی با ارجاع به پیام‌های مهم:",
             "processing_message": f"⏳ در حال دریافت و خلاصه‌سازی {actual_count} پیام اخیر با استفاده از هوش مصنوعی... لطفاً صبر کنید.",
             "error_message": "❌ اوپس! هنگام تولید خلاصه مشکلی پیش آمد. لطفاً بعداً دوباره امتحان کنید. اگر مشکل ادامه داشت، با مدیر ربات تماس بگیرید.",
@@ -895,15 +916,38 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             # Process the summary to add message links for cited messages
             processed_summary = summary_text
             
-            # Use regex to find message IDs in the summary and add links
+            # Use regex to find message IDs in different formats that might be in the summary
             msg_id_pattern = re.compile(r'\(msg_id: (\d+)\)')
+            
+            # Additional patterns that might appear incorrectly formatted
+            additional_patterns = [
+                re.compile(r'msgid: (\d+)'),          # Without parentheses
+                re.compile(r'msg_id:(\d+)'),          # Without space
+                re.compile(r'\(msgid: (\d+)\)'),      # Without underscore
+                re.compile(r'msgid:(\d+)'),           # Without space or underscore
+                re.compile(r'msg id: (\d+)'),         # With space instead of underscore
+                re.compile(r'message id: (\d+)'),     # Full words
+                re.compile(r'ID: (\d+)'),             # Just ID
+            ]
             
             # Only add links if this is a public supergroup (starts with -100)
             is_public_group = str(chat_id).startswith('-100')
             
             if is_public_group:
-                # Find all message ID references and replace with links
+                # Check if summary is in Persian language to handle RTL issues
+                is_persian = chat_lang == "fa"
+                
+                # Process with the standard pattern first
                 matches = msg_id_pattern.findall(processed_summary)
+                
+                # Then check additional patterns and add any new matches
+                for pattern in additional_patterns:
+                    additional_matches = pattern.findall(processed_summary)
+                    if additional_matches:
+                        matches.extend(additional_matches)
+                        # Log that we found non-standard formats
+                        logger.info(f"Found {len(additional_matches)} message IDs in non-standard format")
+                
                 # Process unique message IDs to avoid redundant processing
                 unique_msg_ids = set(matches)
                 
@@ -915,11 +959,51 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                         msg_id = int(msg_id_str)
                         msg_link = get_message_link(chat_id, msg_id)
                         if msg_link:
-                            # Use a simpler replacement format that's less likely to break
-                            # Telegram's markdown parser
-                            old_text = f"(msg_id: {msg_id})"
-                            new_text = f"(msg_id: {msg_id}) [link]({msg_link})"
-                            processed_summary = processed_summary.replace(old_text, new_text)
+                            # Different formats for Persian (RTL) and other languages (LTR)
+                            standard_pattern = f"(msg_id: {msg_id})"
+                            
+                            # Create the replacement text based on language
+                            if is_persian:
+                                # For Persian, add explicit RTL/LTR markers and use Persian word for link
+                                # \u200F is RTL mark, \u200E is LTR mark to control text direction
+                                # Add some non-breaking space for better formatting
+                                new_text = f"(msg_id: {msg_id}) \u200E[\u202Dپیوند\u202C]({msg_link})\u200F"
+                                
+                                # Additional fix for specific msgid: pattern with no space that's appearing in the output
+                                if "msgid:" + msg_id_str in processed_summary:
+                                    processed_summary = processed_summary.replace(
+                                        "msgid:" + msg_id_str, 
+                                        f"(msg_id: {msg_id}) \u200E[\u202Dپیوند\u202C]({msg_link})\u200F"
+                                    )
+                                # Catch cases where msgid and link are fused together
+                                if "msgid: " + msg_id_str + "link" in processed_summary:
+                                    processed_summary = processed_summary.replace(
+                                        "msgid: " + msg_id_str + "link", 
+                                        f"(msg_id: {msg_id}) \u200E[\u202Dپیوند\u202C]({msg_link})\u200F"
+                                    )
+                            else:
+                                # Format for LTR languages like English
+                                new_text = f"(msg_id: {msg_id}) [link]({msg_link})"
+                            
+                            # Replace standard format first
+                            if standard_pattern in processed_summary:
+                                processed_summary = processed_summary.replace(standard_pattern, new_text)
+                            else:
+                                # Try to replace other possible formats
+                                for pattern_str in [
+                                    f"msgid: {msg_id}",
+                                    f"msg_id:{msg_id}",
+                                    f"(msgid: {msg_id})",
+                                    f"msgid:{msg_id}",
+                                    f"msg id: {msg_id}",
+                                    f"message id: {msg_id}",
+                                    f"ID: {msg_id}"
+                                ]:
+                                    if pattern_str in processed_summary:
+                                        processed_summary = processed_summary.replace(pattern_str, new_text)
+                                        # Once replaced, no need to try other patterns for this ID
+                                        break
+                                
                     except (ValueError, TypeError) as e:
                         logger.warning(f"Error processing message ID {msg_id_str} for linking: {e}")
                         replacement_success = False
@@ -929,7 +1013,7 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     logger.warning(f"Some message link replacements failed for chat {chat_id}. The summary may have formatting issues.")
                 
             # Sanitize markdown to fix common issues that would cause Telegram parsing errors
-            sanitized_summary = sanitize_markdown(processed_summary)
+            sanitized_summary = sanitize_markdown(processed_summary, is_rtl=is_persian)
             
             reply_text = (
                 f"{templates['summary_header']}"
