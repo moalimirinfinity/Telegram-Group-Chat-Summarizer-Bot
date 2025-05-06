@@ -448,6 +448,10 @@ def sanitize_markdown(text: str, is_rtl: bool = False) -> str:
     # Check for and fix unbalanced entities
     sanitized = text
     
+    # Fix bolding format - Telegram uses single asterisks for bold (*bold*), not double asterisks (**bold**)
+    # Replace double asterisks with single ones for compatibility
+    sanitized = re.sub(r'\*\*([^*]+)\*\*', r'*\1*', sanitized)
+    
     # Fix improper nesting of entities (Telegram doesn't support nested entities)
     # e.g. *bold _italic_* is not allowed, should be *bold* _italic_
     
@@ -514,6 +518,11 @@ def sanitize_markdown(text: str, is_rtl: bool = False) -> str:
     
     # Replace triple backticks with single backticks (Telegram doesn't support code blocks with ```)
     sanitized = re.sub(r'```([^`]+)```', r'`\1`', sanitized)
+    
+    # Ensure there are no consecutive markdown entities without space between them, 
+    # which can cause parsing issues
+    sanitized = re.sub(r'(\*[^*]+\*)(\*[^*]+\*)', r'\1 \2', sanitized)
+    sanitized = re.sub(r'(_[^_]+_)(_[^_]+_)', r'\1 \2', sanitized)
     
     # Final precaution: limit to Telegram's max message length for safety
     if len(sanitized) > 4096:
@@ -702,16 +711,20 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     "Focus on key discussion points, decisions made, questions asked, and any action items mentioned.\n\n"
                     "Structure your summary as follows:\n"
                     "1. Start with a very brief overall summary in 1-2 sentences\n"
-                    "2. Organize content into clearly labeled **important topics** using bold headings with emoji prefixes\n"
+                    "2. Organize content into clearly labeled *important topics* using bold headings with emoji prefixes\n"
                     "3. For each topic, identify and reference critical messages using the format: '@username (or username if @ not available) said: [message content]'\n"
                     "4. When referencing a message, include its message_id in parentheses like (msg_id: 12345) so I can create links to those messages\n"
                     "5. Specifically mention people by their Telegram usernames (e.g., @username) or IDs when they've made important contributions\n"
                     "6. Format important information, names, and numbers in *bold* or _italic_ for emphasis\n\n"
-                    "IMPORTANT: For each key message you reference, always include the message ID so I can link to it later. This is essential for traceability.",
+                    "IMPORTANT FORMAT INSTRUCTIONS:\n"
+                    "- For bold text, use single asterisks like *this is bold* (not double asterisks)\n"
+                    "- For italic text, use single underscores like _this is italic_\n"
+                    "- Always include the message ID format exactly as (msg_id: NUMBER) for each referenced message\n"
+                    "- Leave space between formatted text elements",
             "summary_request": "Topic-based summary with references to critical messages:",
             "processing_message": f"⏳ Fetching and summarizing the last {actual_count} cached messages using AI... please wait.",
             "error_message": "❌ Oops! Something went wrong while generating the summary. Please try again later. If the problem persists, contact the bot admin.",
-            "summary_header": f"**✨ TOPIC-BASED SUMMARY OF RECENT MESSAGES ✨**\n\n",
+            "summary_header": f"*✨ TOPIC-BASED SUMMARY OF RECENT MESSAGES ✨*\n\n",
             "summary_footer": ""
         },
         "fa": {
@@ -720,16 +733,20 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     "بر نکات کلیدی بحث، تصمیمات گرفته شده، سؤالات مطرح شده، و هرگونه موارد عملی ذکر شده تمرکز کنید.\n\n"
                     "خلاصه خود را به این شکل ساختاربندی کنید:\n"
                     "1. با یک خلاصه کلی و بسیار مختصر در 1-2 جمله شروع کنید\n"
-                    "2. محتوا را به **موضوعات مهم** با عناوین پررنگ و ایموجی مناسب سازماندهی کنید\n"
+                    "2. محتوا را به *موضوعات مهم* با عناوین پررنگ و ایموجی مناسب سازماندهی کنید\n"
                     "3. برای هر موضوع، پیام‌های مهم را با قالب '@نام‌کاربری (یا نام کاربر اگر @ موجود نیست) گفت: [محتوای پیام]' ارجاع دهید\n"
                     "4. هنگام ارجاع به یک پیام، شناسه پیام را در پرانتز مانند (msg_id: 12345) قرار دهید تا بتوانم به این پیام‌ها لینک ایجاد کنم\n"
                     "5. به طور خاص افراد را با نام کاربری تلگرام آنها (مانند @نام‌کاربری) یا شناسه‌هایشان ذکر کنید وقتی نکات مهمی ارائه داده‌اند\n"
                     "6. اطلاعات مهم، نام‌ها و اعداد را با فرمت *پررنگ* یا _مورب_ برای تأکید قالب‌بندی کنید\n\n"
-                    "مهم: برای هر پیام کلیدی که ارجاع می‌دهید، همیشه از کلمه \"msg_id: شماره\" مانند (msg_id: 12345) استفاده کنید. از ترکیب کلمات \"msgid\" یا هر فرمت دیگری استفاده نکنید. این برای قابلیت ردیابی و ایجاد لینک ضروری است.",
+                    "دستورالعمل‌های مهم قالب‌بندی:\n"
+                    "- برای متن پررنگ، از یک ستاره در هر طرف مانند *این متن پررنگ است* استفاده کنید (نه دو ستاره)\n"
+                    "- برای متن مورب، از یک زیرخط در هر طرف مانند _این متن مورب است_ استفاده کنید\n"
+                    "- همیشه شناسه پیام را دقیقاً به صورت (msg_id: شماره) برای هر پیام ارجاع شده قرار دهید\n"
+                    "- بین عناصر متنی قالب‌بندی شده فاصله بگذارید",
             "summary_request": "خلاصه موضوعی با ارجاع به پیام‌های مهم:",
             "processing_message": f"⏳ در حال دریافت و خلاصه‌سازی {actual_count} پیام اخیر با استفاده از هوش مصنوعی... لطفاً صبر کنید.",
             "error_message": "❌ اوپس! هنگام تولید خلاصه مشکلی پیش آمد. لطفاً بعداً دوباره امتحان کنید. اگر مشکل ادامه داشت، با مدیر ربات تماس بگیرید.",
-            "summary_header": f"**✨ خلاصه موضوعی پیام‌های اخیر ✨**\n\n",
+            "summary_header": f"*✨ خلاصه موضوعی پیام‌های اخیر ✨*\n\n",
             "summary_footer": ""
         }
     }
@@ -1022,7 +1039,13 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             )
             
             # Send the message - edit_or_reply_message will handle parsing errors gracefully
-            await edit_or_reply_message(context, chat_id, reply_text, processing_msg_id, constants.ParseMode.MARKDOWN)
+            await edit_or_reply_message(
+                context, 
+                chat_id, 
+                reply_text, 
+                processing_msg_id, 
+                constants.ParseMode.MARKDOWN
+            )
             logger.info(f"Successfully generated and sent summary for chat {chat_id} ({actual_count} messages) requested by user {user_id}.")
         except Exception as final_send_err:
             logger.error(f"Error preparing or sending final summary message for chat {chat_id}: {final_send_err}", exc_info=True)
