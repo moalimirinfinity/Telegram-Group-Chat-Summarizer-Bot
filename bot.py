@@ -9,6 +9,17 @@ import json # For potentially dumping update object
 import google.api_core.exceptions
 from collections import defaultdict, deque
 from datetime import datetime, timezone, timedelta
+import psutil  # For memory monitoring
+
+# --- Logging Setup ---
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+    datefmt='%Y-%m-%dT%H:%M:%S%z'
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext").setLevel(logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Third-party libraries
 import google.generativeai as genai
@@ -41,10 +52,42 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 # Allow specifying model via env var, default to flash
 GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-1.5-flash")
 # Optional: Admin user ID for receiving critical error notifications
-ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
+admin_id = os.getenv("ADMIN_CHAT_ID")
+if admin_id:
+    try:
+        ADMIN_CHAT_ID = int(admin_id)
+        logger.info(f"Admin notifications will be sent to chat ID: {ADMIN_CHAT_ID}")
+    except ValueError:
+        logger.warning(f"Invalid ADMIN_CHAT_ID value '{admin_id}'. Admin notifications will be disabled.")
+        ADMIN_CHAT_ID = None
+else:
+    ADMIN_CHAT_ID = None
 # API timeout in seconds (default: 30 seconds)
-API_TIMEOUT_SECONDS = int(os.getenv("API_TIMEOUT_SECONDS", "30"))
+try:
+    API_TIMEOUT_SECONDS = int(os.getenv("API_TIMEOUT_SECONDS", "30"))
+    # Ensure timeout is reasonable (between 5 and 120 seconds)
+    if API_TIMEOUT_SECONDS < 5 or API_TIMEOUT_SECONDS > 120:
+        logger.warning(f"API_TIMEOUT_SECONDS value {API_TIMEOUT_SECONDS} is outside recommended range (5-120). Using default of 30.")
+        API_TIMEOUT_SECONDS = 30
+except ValueError:
+    logger.warning(f"Invalid API_TIMEOUT_SECONDS value. Using default of 30.")
+    API_TIMEOUT_SECONDS = 30
 
+# Setup memory monitoring
+def log_memory_usage():
+    """Log current memory usage of the bot process."""
+    process = psutil.Process(os.getpid())
+    memory_info = process.memory_info()
+    memory_mb = memory_info.rss / 1024 / 1024  # Convert to MB
+    logger.info(f"Current memory usage: {memory_mb:.2f} MB")
+
+# Periodically log memory usage (e.g., every hour)
+def schedule_memory_logging():
+    """Schedule periodic memory usage logging."""
+    log_memory_usage()
+    # Schedule next check in 1 hour
+    loop = asyncio.get_event_loop()
+    loop.call_later(3600, schedule_memory_logging)  # 3600 seconds = 1 hour
 
 if not TELEGRAM_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set.")
@@ -55,12 +98,24 @@ if not GEMINI_API_KEY:
 try:
     genai.configure(api_key=GEMINI_API_KEY)
     # Apply default safety settings suitable for general chat summarization
-    default_safety_settings: SafetySettingDict = {
-         HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-         HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-         HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-         HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-    }
+    default_safety_settings = [
+        {
+            "category": HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+            "threshold": HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE
+        },
+        {
+            "category": HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+            "threshold": HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE
+        },
+        {
+            "category": HarmCategory.HARM_CATEGORY_HARASSMENT,
+            "threshold": HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE
+        },
+        {
+            "category": HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+            "threshold": HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE
+        }
+    ]
     gemini_model = genai.GenerativeModel(
         model_name=GEMINI_MODEL_NAME,
         safety_settings=default_safety_settings
@@ -79,16 +134,6 @@ MAX_SUMMARY_MESSAGES = 200
 MESSAGE_CACHE_SIZE = 500
 SUMMARY_COOLDOWN_SECONDS = 60
 
-# --- Logging Setup ---
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-    datefmt='%Y-%m-%dT%H:%M:%S%z'
-)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("telegram.ext").setLevel(logging.INFO)
-logger = logging.getLogger(__name__)
-
 # --- In-Memory Caches ---
 message_cache: dict[int, deque[tuple[int, str, str, datetime]]] = defaultdict(lambda: deque(maxlen=MESSAGE_CACHE_SIZE))
 user_last_summary_request: dict[int, float] = {}
@@ -102,7 +147,7 @@ def sanitize_for_prompt(text: str) -> str:
     """Basic sanitization for user names included in prompts."""
     return text.replace('[', '(').replace(']', ')')
 
-def format_message_for_gemini(msg_data: tuple) -> str:
+def format_message_for_gemini(msg_data: tuple[int, str, str, datetime]) -> str:
     """Formats a single message tuple for the Gemini prompt."""
     message_id, user_name, text, timestamp = msg_data
     ts_str = timestamp.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -110,7 +155,7 @@ def format_message_for_gemini(msg_data: tuple) -> str:
     text_content = text if text is not None else ""
     return f"[{ts_str} - {safe_user_name} (ID: {message_id})]: {text_content}"
 
-def format_messages_for_prompt(messages: list[tuple]) -> str:
+def format_messages_for_prompt(messages: list[tuple[int, str, str, datetime]]) -> str:
     """Formats a list of message tuples into a single string for the Gemini prompt."""
     return "\n".join(format_message_for_gemini(msg) for msg in messages)
 
@@ -139,9 +184,21 @@ async def edit_or_reply_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int
     except TelegramError as send_err:
         logger.error(f"Failed even to send new message to chat {chat_id} after edit failed or wasn't applicable: {send_err}")
 
-def detect_language(messages: list[tuple]) -> str:
-    """Detect the most common language in a list of messages, supporting only English and Persian.
-    Uses a weighted approach with confidence threshold for more reliable detection."""
+def detect_language(messages: list[tuple[int, str, str, datetime]]) -> str:
+    """
+    Detect the primary language used in a list of messages, supporting English and Persian.
+    
+    Uses a weighted approach with confidence threshold for more reliable detection.
+    Currently optimized for distinguishing between English and Persian languages
+    specifically, with a bias toward English as default.
+    
+    Args:
+        messages: A list of message tuples in (message_id, user_name, text, timestamp) format
+        
+    Returns:
+        str: A language code, either "en" for English or "fa" for Persian.
+             Defaults to "en" if detection fails or insufficient text is available.
+    """
     if not messages:
         return "en"  # Default to English if no messages
     
@@ -245,6 +302,22 @@ def cleanup_old_cache_entries() -> None:
         last_cache_cleanup = now
     except Exception as e:
         logger.error(f"Error during cache cleanup: {e}", exc_info=True)
+
+async def notify_admin_of_error(context: ContextTypes.DEFAULT_TYPE, error: Exception, source: str, chat_id: int = None, user_id: int = None) -> None:
+    """Send an error notification to the admin if ADMIN_CHAT_ID is configured."""
+    if not ADMIN_CHAT_ID:
+        return
+        
+    try:
+        error_details = (
+            f"Error in {source} for chat {chat_id if chat_id else 'N/A'}, user {user_id if user_id else 'N/A'}:\n"
+            f"Type: {type(error).__name__}\nError: {error}\n"
+            f"Traceback:\n{traceback.format_exc(limit=5)}"
+        )
+        # Send plain text to admin to avoid parsing errors
+        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=error_details[:4000])
+    except Exception as notify_err:
+        logger.error(f"Failed to send error notification to admin {ADMIN_CHAT_ID}: {notify_err}")
 
 # --- Telegram Command Handlers ---
 
@@ -495,6 +568,13 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             ),
             timeout=API_TIMEOUT_SECONDS
         )
+        
+        # Check for None response (shouldn't happen but handle it anyway)
+        if response is None:
+            logger.error(f"Gemini API returned None response for chat {chat_id}, user {user_id}")
+            user_error_message = "❌ Summary generation failed due to an unexpected API response. Please try again later."
+            error_occurred = True
+            raise ValueError("Gemini API returned None response")
 
         # --- Refined Response Handling (for v0.8.5+) ---
         if not response.candidates:
@@ -622,17 +702,7 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     except Exception as e:
         logger.error(f"Unexpected Python error during summary generation/processing for chat {chat_id}, user {user_id}: {e}", exc_info=True)
         error_occurred = True
-        if ADMIN_CHAT_ID:
-            try:
-                error_details = (
-                    f"Unexpected error in summarize_command for chat {chat_id}, user {user_id}:\n"
-                    f"Type: {type(e).__name__}\nError: {e}\n"
-                    f"Traceback:\n{traceback.format_exc(limit=5)}"
-                )
-                # Send plain text to admin to avoid parsing errors
-                await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=error_details[:4000])
-            except Exception as notify_err:
-                logger.error(f"Failed to send error notification to admin {ADMIN_CHAT_ID}: {notify_err}")
+        await notify_admin_of_error(context, e, "summarize_command", chat_id, user_id)
 
     # 7. Send Result or Error Message
     if not error_occurred and summary_text:
@@ -652,6 +722,139 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await edit_or_reply_message(context, chat_id, user_error_message, processing_msg_id)
         logger.warning(f"Summary failed for chat {chat_id} requested by user {user_id}. Sent error/info message to user.")
 
+# --- Message Handler ---
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Stores incoming text messages from groups/supergroups in the cache."""
+    if not update.message or not update.message.text or update.message.via_bot:
+        return
+
+    # Periodically clean up old cache entries
+    cleanup_old_cache_entries()
+
+    chat = update.message.chat
+    if chat.type not in (constants.ChatType.GROUP, constants.ChatType.SUPERGROUP):
+        return
+
+    chat_id = chat.id
+    user = update.message.from_user
+    message = update.message
+
+    if not user:
+        user_name = "Anonymous"
+    else:
+        user_name = user.first_name.strip() if user.first_name else ""
+        if not user_name and user.username:
+            user_name = user.username.strip()
+        if not user_name:
+            user_name = f"User_{user.id}"
+
+    message_id = message.message_id
+    text = message.text
+    timestamp = message.date if message.date else datetime.now(timezone.utc)
+    if timestamp.tzinfo is None:
+         timestamp = timestamp.replace(tzinfo=timezone.utc)
+
+    try:
+        message_data = (message_id, user_name, text, timestamp)
+        message_cache[chat_id].append(message_data)
+        
+        # Update language detection every 10 messages
+        if len(message_cache[chat_id]) % 10 == 0 and len(message_cache[chat_id]) >= 10:
+            # Get the last 20 messages or however many are available
+            recent_messages = list(message_cache[chat_id])[-20:]
+            try:
+                lang = detect_language(recent_messages)
+                if lang:
+                    chat_language_cache[chat_id] = lang
+                    logger.debug(f"Updated language for chat {chat_id} to {lang}")
+            except LangDetectException as lang_err:
+                logger.warning(f"Language detection error for chat {chat_id}: {lang_err}")
+            except Exception as lang_err:
+                logger.error(f"Unexpected error in language detection for chat {chat_id}: {lang_err}")
+                
+    except KeyError as key_err:
+        logger.error(f"KeyError when caching message {message_id} for chat {chat_id}: {key_err}")
+    except IndexError as idx_err:
+        logger.error(f"IndexError when caching message {message_id} for chat {chat_id}: {idx_err}")
+    except AttributeError as attr_err:
+        logger.error(f"AttributeError when caching message {message_id} for chat {chat_id}: {attr_err}")
+    except Exception as cache_err:
+        logger.error(f"Unexpected error when caching message {message_id} for chat {chat_id}: {cache_err}", exc_info=True)
+
+# --- Error Handler ---
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log Errors caused by Updates and notify admin if configured."""
+    logger.error(f"Exception while handling an update: {context.error}", exc_info=context.error)
+
+    # Get chat_id and user_id from update if possible
+    chat_id = None
+    user_id = None
+    if isinstance(update, Update):
+        if update.effective_chat:
+            chat_id = update.effective_chat.id
+        if update.effective_user:
+            user_id = update.effective_user.id
+    
+    # First try our standard notification method
+    await notify_admin_of_error(context, context.error, "update_handler", chat_id, user_id)
+    
+    # If we have an ADMIN_CHAT_ID and the standard notification might not be enough,
+    # provide more detailed update information
+    if ADMIN_CHAT_ID:
+        try:
+            # Format a concise error message for admin
+            tb_list = traceback.format_exception(None, context.error, context.error.__traceback__, limit=5)
+            tb_string = "".join(tb_list)
+
+            # Try to get update details safely, converting to dict if possible
+            update_str = "N/A"
+            if isinstance(update, Update):
+                try:
+                    # Convert Update to dict, then to JSON string for safer display
+                    update_dict = update.to_dict()
+                    update_str = json.dumps(update_dict, indent=2, ensure_ascii=False, default=str) # Use default=str for non-serializable objects
+                except Exception as json_err:
+                    logger.warning(f"Could not serialize update object to JSON: {json_err}")
+                    update_str = str(update) # Fallback to string representation
+            elif update:
+                update_str = str(update)
+
+            error_message = (
+                f"⚠️ BOT ERROR DETAILS ⚠️\n\n"
+                f"Error Type: {type(context.error).__name__}\n"
+                f"Error: {html.escape(str(context.error))}\n\n" # Escape potential HTML in error message
+                f"Update (limited):\n<pre>{html.escape(update_str[:500])}...</pre>\n\n" # Use <pre> and escape update string
+                f"Traceback (limited):\n<pre>{html.escape(tb_string[:3000])}</pre>" # Use <pre> and escape traceback
+            )
+
+            # Send error to admin chat using HTML parse mode for <pre> tags
+            await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=error_message[:4096], # Telegram message length limit
+                parse_mode=constants.ParseMode.HTML # Use HTML for <pre> tags
+            )
+        except Exception as notify_err:
+            logger.error(f"CRITICAL: Failed to send detailed error notification to admin {ADMIN_CHAT_ID}: {notify_err}")
+            # The basic notification was already attempted via notify_admin_of_error
+
+async def shutdown(application: Application) -> None:
+    """Handle graceful shutdown when the bot receives a stop signal."""
+    logger.info("Graceful shutdown initiated...")
+    
+    # Close any active database connections or external resources here if needed
+    
+    # Cleanup tasks
+    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    if tasks:
+        logger.info(f"Cancelling {len(tasks)} outstanding tasks")
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    
+    logger.info("All resources have been properly released")
+
 def main() -> None:
     """Sets up the Telegram Application and starts the bot polling."""
     # Display bot startup banner
@@ -663,3 +866,76 @@ def main() -> None:
     └───────────────────────────────────────────────┘
     """
     print(startup_banner)
+    
+    logger.info(f"--- Initializing Telegram Bot (PID: {os.getpid()}) ---")
+    
+    # Log system and environment information
+    import platform
+    import sys
+    
+    logger.info(f"Python version: {sys.version}")
+    logger.info(f"Platform: {platform.platform()}")
+    logger.info(f"Using Telegram Bot Token: {'*' * (len(TELEGRAM_TOKEN or '') - 4)}{(TELEGRAM_TOKEN or '')[-4:] if TELEGRAM_TOKEN else 'None'}")
+    logger.info(f"Using Gemini model: {GEMINI_MODEL_NAME}")
+    logger.info(f"Message cache size per chat: {MESSAGE_CACHE_SIZE}")
+    logger.info(f"Default summary length: {DEFAULT_SUMMARY_MESSAGES}, Max: {MAX_SUMMARY_MESSAGES}")
+    logger.info(f"Summary command cooldown: {SUMMARY_COOLDOWN_SECONDS} seconds per user")
+    logger.info(f"API timeout: {API_TIMEOUT_SECONDS} seconds")
+    logger.info(f"Cache cleanup interval: {CACHE_CLEANUP_INTERVAL} seconds")
+    if ADMIN_CHAT_ID:
+        logger.info(f"Admin chat ID for notifications: {ADMIN_CHAT_ID}")
+    else:
+        logger.warning("ADMIN_CHAT_ID not set. Error notifications will not be sent via Telegram.")
+
+    try:
+        builder = ApplicationBuilder().token(TELEGRAM_TOKEN)
+        application = builder.build()
+
+        application.add_handler(CommandHandler("start", start_command))
+        application.add_handler(CommandHandler("help", start_command))
+        application.add_handler(CommandHandler(COMMAND_NAME, summarize_command))
+
+        application.add_handler(MessageHandler(
+            filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS & ~filters.VIA_BOT,
+            handle_message
+        ))
+
+        application.add_error_handler(error_handler)
+        
+        # Register shutdown handler
+        application.post_shutdown = shutdown
+
+        # Start memory monitoring
+        loop = asyncio.get_event_loop()
+        loop.call_soon(schedule_memory_logging)
+
+        logger.info("Bot polling started...")
+        print("✅ Bot is now online and listening for messages!")
+        application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
+    except Exception as e:
+        logger.critical(f"Critical error during bot initialization or polling: {e}", exc_info=True)
+        print(f"❌ Error starting bot: {e}")
+        if ADMIN_CHAT_ID:
+            # Try to notify admin even if we can't start polling
+            try:
+                # Create a basic application object just for sending a message
+                temp_app = Application.builder().token(TELEGRAM_TOKEN).build()
+                asyncio.run(notify_admin_of_error(temp_app, e, "bot_startup"))
+            except Exception as notify_err:
+                logger.error(f"Failed to notify admin about startup failure: {notify_err}")
+                # Last resort - direct API call
+                try:
+                    import httpx
+                    message = f"🚨 CRITICAL: Bot failed to start!\nError: {type(e).__name__} - {e}"
+                    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+                    httpx.post(url, json={"chat_id": ADMIN_CHAT_ID, "text": message})
+                except Exception as httpx_err:
+                    logger.error(f"Failed even with direct API call to notify admin: {httpx_err}")
+    finally:
+        # Perform cleanup
+        logger.info("--- Bot polling stopped, cleaning up resources ---")
+        print("👋 Bot is shutting down...")
+
+if __name__ == "__main__":
+    main()
