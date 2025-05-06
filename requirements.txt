@@ -14,10 +14,10 @@ python-dotenv==1.0.1
 langdetect==1.0.9
 
 # HTTP client used by underlying libraries
-httpx>=0.27,<0.28
+httpx==0.27.0
 
 # Additional API error handling
-google-api-core>=2.11.0
+google-api-core==2.17.1
 
 # System utilities
-psutil>=5.9.0  # For monitoring memory usage (optional)
+psutil==5.9.6  # For monitoring memory usage (optional)
