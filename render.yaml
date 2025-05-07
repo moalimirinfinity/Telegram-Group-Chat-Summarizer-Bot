@@ -1,0 +1,26 @@
+services:
+  # A web service with a healthcheck
+  - type: web
+    name: telegram-summarizer-bot
+    runtime: python
+    plan: free # Uses the free plan
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: WEBHOOK_URL
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: GEMINI_MODEL_NAME
+        sync: false
+        value: gemini-1.5-flash
+      - key: ADMIN_CHAT_ID
+        sync: false
+      - key: WEBHOOK_PATH
+        sync: false
+        value: /webhook 

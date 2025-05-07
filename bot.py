@@ -5,16 +5,6 @@ Telegram Group Chat Summarizer Bot
 This bot listens to messages in Telegram group chats, stores them in memory,
 and generates concise summaries using Google's Gemini AI model when requested.
 
-Recent improvements:
-- Added topic-based summarization with references to critical messages
-- Implemented message link generation for public groups
-- Added robust markdown handling to fix parsing errors
-- Improved backward compatibility with existing message cache format
-- Enhanced error handling for Telegram formatting issues
-
-The bot now creates summaries organized by topic, with references to important 
-messages including usernames/IDs of the contributors. For public groups, it also
-adds clickable links to the original messages.
 """
 import logging
 import os
@@ -24,10 +14,11 @@ import traceback
 import html # For escaping HTML in error handler
 import json # For potentially dumping update object
 import google.api_core.exceptions
+import sys # For system exit
 from collections import defaultdict, deque
 from datetime import datetime, timezone, timedelta
 import psutil  # For memory monitoring
-from typing import Optional
+from typing import Optional, Dict, List, Tuple, Any
 import re
 
 # --- Logging Setup ---
@@ -103,10 +94,16 @@ def log_memory_usage():
 # Periodically log memory usage (e.g., every hour)
 def schedule_memory_logging():
     """Schedule periodic memory usage logging."""
-    log_memory_usage()
-    # Schedule next check in 1 hour
-    loop = asyncio.get_event_loop()
-    loop.call_later(3600, schedule_memory_logging)  # 3600 seconds = 1 hour
+    try:
+        log_memory_usage()
+        # Schedule next check in 1 hour
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.call_later(3600, schedule_memory_logging)  # 3600 seconds = 1 hour
+        else:
+            logger.warning("Event loop is not running, cannot schedule memory logging")
+    except Exception as e:
+        logger.error(f"Error in memory monitoring: {e}", exc_info=True)
 
 if not TELEGRAM_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set.")
@@ -142,7 +139,6 @@ try:
     logging.info(f"Successfully configured Gemini AI with model: {GEMINI_MODEL_NAME}")
 except Exception as e:
     logging.critical(f"CRITICAL: Failed to configure or test Gemini AI: {e}", exc_info=True)
-    import sys
     print(f"CRITICAL: Failed to configure Gemini: {e}", file=sys.stderr)
     sys.exit(1)
 
@@ -159,6 +155,10 @@ user_last_summary_request: dict[int, float] = {}
 chat_language_cache: dict[int, str] = {}  # Store detected language by chat_id
 last_cache_cleanup: float = time.monotonic()  # Time tracker for periodic cache cleanup
 CACHE_CLEANUP_INTERVAL = 3600
+
+# Rate limiting settings for message handling
+MESSAGE_RATE_LIMIT = 30  # Maximum messages per minute per chat
+message_rate_counters: Dict[int, List[float]] = defaultdict(list)  # chat_id -> list of message timestamps
 
 # --- Helper Functions ---
 
@@ -182,29 +182,51 @@ def format_message_for_gemini(msg_data: tuple) -> str:
     Handles both old (4-element) and new (6-element) tuple formats for backward compatibility.
     Provides rich context and makes username/user references prominent for linking.
     """
+    # Validate input data type
+    if not isinstance(msg_data, tuple):
+        logger.warning(f"Invalid message data type: {type(msg_data)}. Expected tuple.")
+        return f"[ERROR: Invalid message format]"
+        
     # Handle both old and new message formats for backward compatibility
-    if len(msg_data) >= 6:  # New format with user_id and username
-        message_id, user_name, text, timestamp, user_id, username = msg_data
-    else:  # Old format (backward compatibility)
-        message_id, user_name, text, timestamp = msg_data
-        user_id = None
-        username = None
-    
-    ts_str = timestamp.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-    safe_user_name = sanitize_for_prompt(user_name)
-    text_content = text if text is not None else ""
-    
-    # Format the user information with emphasis on username for better AI recognition
-    # This makes it easier for AI to consistently reference usernames in summaries
-    user_info = f"{safe_user_name}"
-    if username:
-        # Make username prominent for better detection and linking
-        user_info = f"@{username} ({safe_user_name})"
-    elif user_id:
-        user_info += f" [ID: {user_id}]"
-    
-    # Include message_id as metadata but not something expected to be in the output
-    return f"[{ts_str} - {user_info} - Message #{message_id}]: {text_content}"
+    try:
+        if len(msg_data) >= 6:  # New format with user_id and username
+            message_id, user_name, text, timestamp, user_id, username = msg_data
+        else:  # Old format (backward compatibility)
+            message_id, user_name, text, timestamp = msg_data
+            user_id = None
+            username = None
+        
+        # Validate essential fields
+        if not isinstance(message_id, int):
+            message_id = 0
+        
+        if not isinstance(user_name, str):
+            user_name = "Unknown"
+            
+        if not isinstance(text, str):
+            text = "" if text is None else str(text)
+            
+        if not isinstance(timestamp, datetime):
+            timestamp = datetime.now(timezone.utc)
+            
+        ts_str = timestamp.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        safe_user_name = sanitize_for_prompt(user_name)
+        text_content = text if text is not None else ""
+        
+        # Format the user information with emphasis on username for better AI recognition
+        # This makes it easier for AI to consistently reference usernames in summaries
+        user_info = f"{safe_user_name}"
+        if username and isinstance(username, str):
+            # Make username prominent for better detection and linking
+            user_info = f"@{username} ({safe_user_name})"
+        elif user_id:
+            user_info += f" [ID: {user_id}]"
+        
+        # Include message_id as metadata but not something expected to be in the output
+        return f"[{ts_str} - {user_info} - Message #{message_id}]: {text_content}"
+    except Exception as e:
+        logger.error(f"Error formatting message for Gemini: {e}", exc_info=True)
+        return f"[ERROR: Message format error: {str(e)}]"
 
 def format_messages_for_prompt(messages: list) -> str:
     """Formats a list of message tuples into a single string for the Gemini prompt.
@@ -259,32 +281,21 @@ async def edit_or_reply_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int
     except TelegramError as send_err:
         # If parsing error, try again without formatting
         if "Can't parse entities" in str(send_err) and parse_mode:
-            logger.error(f"Failed to send message with parsing: {send_err}. Trying plain text.")
             try:
-                # Strip all markdown symbols and try again
+                # Strip all markdown symbols for plain text
                 plain_text = re.sub(r'[\*_\[\]\(\)`]', '', text)
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=plain_text,
-                    parse_mode=None, 
+                    parse_mode=None,
                     disable_web_page_preview=disable_web_page_preview
                 )
-                logger.info("Successfully sent message as plain text.")
+                logger.info(f"Successfully sent plain text message after parsing failed.")
                 return
             except TelegramError as plain_send_err:
-                logger.error(f"Failed to send even plain text message: {plain_send_err}")
-        else:
-            logger.error(f"Failed to send message to chat {chat_id}: {send_err}")
-    
-    # Last resort: try to send a short error message
-    try:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="❌ Error displaying the summary due to formatting issues.",
-            parse_mode=None
-        )
-    except TelegramError as final_err:
-        logger.error(f"Failed to send even a simple error message to chat {chat_id}: {final_err}")
+                logger.error(f"Failed to send even with plain text: {plain_send_err}")
+                raise plain_send_err
+        raise send_err
 
 def detect_language(messages: list) -> str:
     """
@@ -398,9 +409,26 @@ def cleanup_old_cache_entries() -> None:
         for chat_id in chats_to_remove:
             message_cache.pop(chat_id, None)
             chat_language_cache.pop(chat_id, None)
+            message_rate_counters.pop(chat_id, None)  # Clean up rate limit counters
             
-        if users_to_remove or chats_to_remove:
-            logger.info(f"Cache cleanup: removed {len(users_to_remove)} user entries and {len(chats_to_remove)} chat entries")
+        # Clean up any old rate limit counters that might still exist
+        current_time = time.time()
+        rate_limit_chats_to_remove = []
+        for chat_id, timestamps in message_rate_counters.items():
+            # Keep only timestamps from the last hour
+            message_rate_counters[chat_id] = [t for t in timestamps if current_time - t < 3600]
+            # If all timestamps were removed, mark for complete removal
+            if not message_rate_counters[chat_id]:
+                rate_limit_chats_to_remove.append(chat_id)
+                
+        # Remove empty rate limit counters
+        for chat_id in rate_limit_chats_to_remove:
+            message_rate_counters.pop(chat_id, None)
+            
+        if users_to_remove or chats_to_remove or rate_limit_chats_to_remove:
+            logger.info(f"Cache cleanup: removed {len(users_to_remove)} user entries, "
+                        f"{len(chats_to_remove)} chat entries, and "
+                        f"{len(rate_limit_chats_to_remove)} rate limit entries")
             
         # Update last cleanup time
         last_cache_cleanup = now
@@ -408,20 +436,28 @@ def cleanup_old_cache_entries() -> None:
         logger.error(f"Error during cache cleanup: {e}", exc_info=True)
 
 async def notify_admin_of_error(context: ContextTypes.DEFAULT_TYPE, error: Exception, source: str, chat_id: int = None, user_id: int = None) -> None:
-    """Send an error notification to the admin if ADMIN_CHAT_ID is configured."""
+    """Send a concise error notification to the admin if configured."""
     if not ADMIN_CHAT_ID:
         return
-        
+    
     try:
-        error_details = (
-            f"Error in {source} for chat {chat_id if chat_id else 'N/A'}, user {user_id if user_id else 'N/A'}:\n"
-            f"Type: {type(error).__name__}\nError: {error}\n"
-            f"Traceback:\n{traceback.format_exc(limit=5)}"
+        error_type = type(error).__name__
+        error_message = str(error)
+        context_info = f"Source: {source}"
+        if chat_id:
+            context_info += f", Chat: {chat_id}"
+        if user_id:
+            context_info += f", User: {user_id}"
+        
+        notification = f"🚨 Bot Error: {error_type}\n{error_message}\n{context_info}"
+        
+        # Use the bot from context to send message
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=notification[:4000]  # Ensure we don't exceed message length
         )
-        # Send plain text to admin to avoid parsing errors
-        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=error_details[:4000])
     except Exception as notify_err:
-        logger.error(f"Failed to send error notification to admin {ADMIN_CHAT_ID}: {notify_err}")
+        logger.error(f"Failed to notify admin of error: {notify_err}")
 
 def sanitize_markdown(text: str, is_rtl: bool = False) -> str:
     """
@@ -1084,6 +1120,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     chat_id = chat.id
+    
+    # Apply rate limiting for high-traffic scenarios
+    current_time = time.time()
+    # Keep only messages from the last minute
+    message_rate_counters[chat_id] = [t for t in message_rate_counters[chat_id] 
+                                     if current_time - t < 60]
+    
+    # Check if we're over the rate limit
+    if len(message_rate_counters[chat_id]) >= MESSAGE_RATE_LIMIT:
+        logger.warning(f"Rate limit exceeded for chat {chat_id}: {len(message_rate_counters[chat_id])} messages in the last minute")
+        # Skip processing but don't drop the connection
+        return
+        
+    # Add current message timestamp to the counter
+    message_rate_counters[chat_id].append(current_time)
+    
     user = update.message.from_user
     message = update.message
 
@@ -1207,18 +1259,9 @@ async def shutdown(application: Application) -> None:
     
     logger.info("All resources have been properly released")
 
-def main() -> None:
-    """Sets up the Telegram Application and starts the bot polling."""
-    # Display bot startup banner
-    startup_banner = f"""
-    ┌───────────────────────────────────────────────┐
-    │ 🤖 Telegram Group Chat Summarizer Bot 🤖      │
-    │ Using Google Gemini AI for summarization      │
-    │ Version: 1.1.0                                │
-    └───────────────────────────────────────────────┘
-    """
-    print(startup_banner)
-    
+def setup_bot() -> Application:
+    """Sets up and configures the Telegram Application object for the bot."""
+    # Log bot configuration
     logger.info(f"--- Initializing Telegram Bot (PID: {os.getpid()}) ---")
     
     # Log system and environment information
@@ -1261,6 +1304,30 @@ def main() -> None:
         loop = asyncio.get_event_loop()
         loop.call_soon(schedule_memory_logging)
 
+        logger.info("Bot application initialized successfully")
+        return application
+
+    except Exception as e:
+        logger.critical(f"Critical error during bot initialization: {e}", exc_info=True)
+        print(f"❌ Error initializing bot: {e}")
+        raise
+
+def main() -> None:
+    """Sets up the Telegram Application and starts the bot polling."""
+    # Display bot startup banner
+    startup_banner = f"""
+    ┌───────────────────────────────────────────────┐
+    │ 🤖 Telegram Group Chat Summarizer Bot 🤖      │
+    │ Using Google Gemini AI for summarization      │
+    │ Version: 1.2.0                                │
+    └───────────────────────────────────────────────┘
+    """
+    print(startup_banner)
+    
+    try:
+        # Set up the bot application
+        application = setup_bot()
+        
         logger.info("Bot polling started...")
         print("✅ Bot is now online and listening for messages!")
         application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
@@ -1276,16 +1343,15 @@ def main() -> None:
                 asyncio.run(notify_admin_of_error(temp_app, e, "bot_startup"))
             except Exception as notify_err:
                 logger.error(f"Failed to notify admin about startup failure: {notify_err}")
-                # Last resort - direct API call
-                try:
-                    import httpx
-                    message = f"🚨 CRITICAL: Bot failed to start!\nError: {type(e).__name__} - {e}"
-                    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-                    httpx.post(url, json={"chat_id": ADMIN_CHAT_ID, "text": message})
-                except Exception as httpx_err:
-                    logger.error(f"Failed even with direct API call to notify admin: {httpx_err}")
+            # Last resort - direct API call
+            try:
+                import httpx
+                message = f"🚨 CRITICAL: Bot failed to start!\nError: {type(e).__name__} - {e}"
+                url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+                httpx.post(url, json={"chat_id": ADMIN_CHAT_ID, "text": message})
+            except Exception as httpx_err:
+                logger.error(f"Failed even with direct API call to notify admin: {httpx_err}")
     finally:
-      
         logger.info("--- Bot polling stopped, cleaning up resources ---")
         print("👋 Bot is shutting down...")
 

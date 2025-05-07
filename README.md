@@ -12,6 +12,7 @@ This Telegram bot provides on-demand summaries of recent conversations within a 
 * **In-Memory Caching:** Temporarily stores recent messages (up to 500 per chat) in memory to allow for summarization based on messages received while the bot is active.
 * **User Rate Limiting:** Includes a cooldown period (currently 60 seconds per user) for the `/summarize` command to prevent abuse and manage API load.
 * **Enhanced Error Feedback:** Provides more specific feedback to users in case of issues like API errors, content filtering, or rate limits.
+* **Webhook Support:** The bot can be deployed on platforms like Render using webhooks instead of long polling.
 
 ## Non-Goals
 
@@ -44,11 +45,11 @@ This Telegram bot provides on-demand summaries of recent conversations within a 
     * **Copy the API Key**. Ensure the key is enabled for the Gemini API.
 
 4.  **Prepare the Code:**
-    * Clone this repository or download the code files (`bot.py`, `requirements.txt`, `README.md`). You may also want to create a `.env` file based on `.env.example` if provided, or create it manually.
+    * Clone this repository or download the code files.
     * Navigate to the project directory in your terminal.
 
 5.  **Create Environment File (`.env`):**
-    * Create a file named `.env` in the project directory.
+    * Create a file named `.env` in the project directory based on `env.example`.
     * Add the following lines, replacing the placeholders with your actual credentials:
         ```dotenv
         TELEGRAM_BOT_TOKEN="YOUR_TELEGRAM_BOT_TOKEN_HERE"
@@ -73,11 +74,49 @@ This Telegram bot provides on-demand summaries of recent conversations within a 
         pip install -r requirements.txt
         ```
 
-7.  **Run the Bot:**
-    ```bash
-    python bot.py
-    ```
-    * If everything is configured correctly, you should see log messages indicating the bot has started polling. Keep this terminal window open or use a process manager (like `systemd`, `supervisor`, `screen`, or `tmux`) to run the bot persistently on a server.
+## Running the Bot
+
+You can run the bot in two different modes: polling (traditional) or webhook (for deployment on platforms like Render).
+
+### Option 1: Running with Polling (Local Development)
+
+```bash
+python bot.py
+```
+
+* If everything is configured correctly, you should see log messages indicating the bot has started polling. Keep this terminal window open or use a process manager (like `systemd`, `supervisor`, `screen`, or `tmux`) to run the bot persistently on a server.
+
+### Option 2: Running with Webhooks (Deployment)
+
+1. **Set Additional Environment Variables:**
+   ```dotenv
+   # Required for webhook mode
+   WEBHOOK_URL="https://your-app-name.onrender.com"
+   
+   # Optional webhook path (default is /webhook)
+   WEBHOOK_PATH="/webhook"
+   
+   # Optional but highly recommended for production: secret token for webhook validation
+   WEBHOOK_SECRET="your_random_secret_string"
+   ```
+
+2. **Local Development with Webhooks:**
+   ```bash
+   # Enable development mode for auto-reload
+   DEVELOPMENT=true python app.py
+   ```
+
+3. **Deployment to Render:**
+   * Create a new Web Service on Render
+   * Connect your GitHub repository
+   * Configure the environment variables from your `.env` file in the Render dashboard
+   * Render will automatically use the `Procfile` which starts the application with webhooks
+   * For security, make sure to set a strong `WEBHOOK_SECRET` in your environment variables
+
+4. **Setting the Webhook:**
+   * When the app starts, it will automatically set the webhook to receive updates from Telegram
+   * You can verify this by checking the startup logs
+   * The webhook will be configured with the secret token for validation if specified
 
 ## Usage
 
@@ -96,3 +135,22 @@ This Telegram bot provides on-demand summaries of recent conversations within a 
 * **API Costs & Rate Limits:** Use of the Google Gemini API may incur costs based on usage and Google's pricing. Both Telegram and Google APIs have rate limits. The bot includes user-level cooldowns to help mitigate hitting these, but extremely high usage could still be an issue.
 * **Summary Quality:** The quality and accuracy of the summary depend heavily on the Gemini model used, the quality of the prompt engineering in the code, and the clarity/content of the conversation itself.
 * **Error Handling:** While error handling has been improved to provide better feedback, complex network issues or unexpected API changes might still cause disruptions. Check the bot's logs for detailed error information. If `ADMIN_CHAT_ID` is configured, critical errors will be forwarded via Telegram message.
+* **Webhook Mode:** When using webhook mode, the bot must be accessible via HTTPS with a valid certificate. Platforms like Render provide this automatically.
+
+## Security Considerations
+
+When deploying your bot, especially in webhook mode, security is an important consideration:
+
+1. **Webhook Secret**: Always set a strong `WEBHOOK_SECRET` for webhook validation to ensure only legitimate Telegram servers can send updates to your bot.
+
+2. **HTTPS Requirement**: Webhooks must be served over HTTPS. When deploying on platforms like Render, this is provided automatically.
+
+3. **API Keys Protection**: Never commit your `.env` file containing API keys to version control. Use environment variables in your deployment platform instead.
+
+4. **Rate Limiting**: The bot includes user-level cooldowns to help prevent abuse of both the Telegram and Gemini APIs.
+
+5. **Error Logging**: Configure `ADMIN_CHAT_ID` to receive notifications about critical errors, which helps monitor for potential security issues.
+
+## Health Check Endpoint
+
+When running in webhook mode, a health check endpoint is available at `/health` that returns the status of the bot. This is useful for monitoring the bot's status and ensuring it's running correctly.
