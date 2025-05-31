@@ -1,21 +1,4 @@
-# -*- coding: utf-8 -*-
-"""
-Telegram Group Chat Summarizer Bot
 
-This bot listens to messages in Telegram group chats, stores them in memory,
-and generates concise summaries using Google's Gemini AI model when requested.
-
-Recent improvements:
-- Added topic-based summarization with references to critical messages
-- Implemented message link generation for public groups
-- Added robust markdown handling to fix parsing errors
-- Improved backward compatibility with existing message cache format
-- Enhanced error handling for Telegram formatting issues
-
-The bot now creates summaries organized by topic, with references to important 
-messages including usernames/IDs of the contributors. For public groups, it also
-adds clickable links to the original messages.
-"""
 import logging
 import os
 import asyncio
